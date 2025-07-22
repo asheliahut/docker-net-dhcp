@@ -8,6 +8,8 @@ on:
 jobs:
   docker:
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
 
     env:
       PLUGIN_NAME: ghcr.io/asheliahut/docker-net-dhcp
@@ -24,6 +26,13 @@ jobs:
 
       - name: Install script dependencies
         run: pip3 install -r scripts/requirements.txt
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: https://ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: vars
         name: Generate build vars
