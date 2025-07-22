@@ -8,6 +8,8 @@ name: Release
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
 
     env:
       DOCKER_REPO: ghcr.io/asheliahut/docker-net-dhcp
@@ -22,6 +24,13 @@ jobs:
       - name: Install script dependencies
         run: pip3 install -r scripts/requirements.txt
 
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: https://ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - id: vars
         name: Generate release vars
         run: |
@@ -32,7 +41,7 @@ jobs:
       - name: Tag with release
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.REPO_TOKEN }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           scripts/tag_multiarch_plugin.py -p $PLATFORMS "$DOCKER_REPO:latest" ${{ steps.vars.outputs.version }}
           scripts/tag_multiarch_plugin.py -p $PLATFORMS "$DOCKER_REPO:latest" release
