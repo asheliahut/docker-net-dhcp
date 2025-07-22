@@ -46,7 +46,7 @@ jobs:
       - name: Push
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.REPO_TOKEN }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           make PLUGIN_TAG=${{ steps.vars.outputs.tag }} push-multiarch
           scripts/tag_multiarch_plugin.py -p "$PLATFORMS" "$PLUGIN_NAME:${{ steps.vars.outputs.tag }}" latest
