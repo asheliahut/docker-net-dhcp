@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	dTypes "github.com/docker/docker/api/types"
 	"github.com/mitchellh/mapstructure"
@@ -130,6 +131,13 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 		return dummy, fmt.Errorf("failed to get info from Docker: %w", err)
 	}
 
+	log.Debugf("VP>>>>>> CreateEndpoint netOptions %+v", n)
+	log.Debugf("VP>>>>>> CreateEndpoint netOptions Options %+v", n.Options)
+	log.Debugf("VP>>>>>> CreateEndpoint netOptions Containers %+v", n.Containers)
+	log.Debugf("VP>>>>>> CreateEndpoint netOptions Labels %+v", n.Labels)
+	log.Debugf("VP>>>>>> CreateEndpoint netOptions Services %+v", n.Services)
+	log.Debugf("VP>>>>>> CreateEndpoint netOptions Peers %+v", n.Peers)
+
 	opts, err := decodeOpts(n.Options)
 	if err != nil {
 		return dummy, fmt.Errorf("failed to parse options: %w", err)
@@ -142,6 +150,10 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 // move the interface into the container's namespace and apply the address.
 func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (CreateEndpointResponse, error) {
 	log.WithField("options", r.Options).Debug("CreateEndpoint options")
+	log.Debugf("VP>>>>>> CreateEndpoint Request %+v", r)
+	log.Debugf("VP>>>>>> CreateEndpoint Request Interface %+v", r.Interface)
+	ctx, cancel := context.WithTimeout(ctx, p.awaitTimeout)
+	defer cancel()
 	res := CreateEndpointResponse{
 		Interface: &EndpointInterface{},
 	}
@@ -150,16 +162,31 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		// TODO: Should we allow static IP's somehow?
 		return res, util.ErrIPAM
 	}
+	var opts DHCPNetworkOptions
+	var err error
+	backoff := 2 * time.Second
+	retries := 2
+	for retries >= 0 {
+		opts, err = p.netOptions(ctx, r.NetworkID)
+		if err == nil {
+			break
+		}
+		if err != nil && retries == 0 {
+			return res, fmt.Errorf("failed to get network options: %w", err)
+		}
 
-	opts, err := p.netOptions(ctx, r.NetworkID)
-	if err != nil {
-		return res, fmt.Errorf("failed to get network options: %w", err)
+		log.Debugf("failed to get network options [backoff %s]: %w", backoff)
+		retries--
+		time.Sleep(backoff)
+		backoff *= 2
 	}
 
 	bridge, err := netlink.LinkByName(opts.Bridge)
 	if err != nil {
 		return res, fmt.Errorf("failed to get bridge interface: %w", err)
 	}
+
+	log.Debugf("VP>>>>>> CreateEndpoint 2")
 
 	hostName, ctrName := vethPairNames(r.EndpointID)
 	la := netlink.NewLinkAttrs()
@@ -168,6 +195,9 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		LinkAttrs: la,
 		PeerName:  ctrName,
 	}
+
+	log.Debugf("VP>>>>>> CreateEndpoint 3")
+
 	if r.Interface.MacAddress != "" {
 		addr, err := net.ParseMAC(r.Interface.MacAddress)
 		if err != nil {
@@ -221,7 +251,17 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
-			info, err := udhcpc.GetIP(timeoutCtx, ctrName, &udhcpc.DHCPClientOptions{V6: v6})
+			hostname := ""
+			if r.Options != nil {
+				if idI, ok := r.Options["hostname"]; ok {
+					hostname, _ = idI.(string)
+				}
+			}
+
+			info, err := udhcpc.GetIP(timeoutCtx, ctrName, &udhcpc.DHCPClientOptions{
+				V6:       v6,
+				Hostname: hostname,
+			})
 			if err != nil {
 				return fmt.Errorf("failed to get initial IP%v address via DHCP%v: %w", v6str, v6str, err)
 			}
@@ -268,6 +308,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		"ip":          res.Interface.Address,
 		"ipv6":        res.Interface.AddressIPv6,
 		"gateway":     fmt.Sprintf("%#v", p.joinHints[r.EndpointID].Gateway),
+		"hostname":    hostName,
 	}).Info("Endpoint created")
 
 	return res, nil
