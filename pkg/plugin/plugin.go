@@ -9,9 +9,9 @@ import (
 	"regexp"
 	"time"
 
-	dTypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	docker "github.com/docker/docker/client"
 	"github.com/gorilla/handlers"
 	"github.com/mitchellh/mapstructure"
@@ -204,7 +204,7 @@ func (p *Plugin) Close() error {
 // monitorContainerEvents watches for container lifecycle events
 func (p *Plugin) monitorContainerEvents() {
 	// Set up Docker events listener
-	eventOptions := dTypes.EventsOptions{
+	eventOptions := events.ListOptions{
 		Filters: filters.NewArgs(),
 	}
 	eventOptions.Filters.Add("type", "container")
@@ -281,7 +281,7 @@ func (p *Plugin) isManagerForContainer(manager *dhcpManager, containerID string)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	dockerNet, err := p.docker.NetworkInspect(ctx, manager.joinReq.NetworkID, dTypes.NetworkInspectOptions{})
+	dockerNet, err := p.docker.NetworkInspect(ctx, manager.joinReq.NetworkID, network.InspectOptions{})
 	if err != nil {
 		log.WithError(err).WithField("network", manager.joinReq.NetworkID[:12]).Warn("Failed to inspect network for container matching")
 		return false
