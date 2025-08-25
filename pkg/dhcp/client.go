@@ -1,0 +1,579 @@
+package dhcp
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"runtime"
+	"time"
+
+	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv4/nclient4"
+	"github.com/insomniacslk/dhcp/dhcpv6"
+	"github.com/insomniacslk/dhcp/dhcpv6/nclient6"
+	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netns"
+
+	"github.com/asheliahut/docker-net-dhcp/pkg/util"
+)
+
+// Info contains DHCP lease information
+type Info struct {
+	IP      string
+	Gateway string
+	Domain  string
+}
+
+// DHCPClientOptions contains options for the DHCP client
+type DHCPClientOptions struct {
+	Hostname  string
+	V6        bool // Currently unsupported, kept for compatibility
+	Namespace string
+	RequestIP string
+	LeaseTime time.Duration // Optional lease time preference
+}
+
+// DHCPClient represents a native Go DHCP client
+type DHCPClient struct {
+	opts      *DHCPClientOptions
+	ifaceName string
+	client4   *nclient4.Client
+	client6   *nclient6.Client
+	lease4    *nclient4.Lease
+	lease6    *dhcpv6.Message
+	stopChan  chan struct{}
+}
+
+// Event represents a DHCP event
+type Event struct {
+	Type string
+	Data Info
+}
+
+// NewDHCPClient creates a new native Go DHCP client
+func NewDHCPClient(iface string, opts *DHCPClientOptions) (*DHCPClient, error) {
+	log.WithFields(log.Fields{
+		"interface":  iface,
+		"hostname":   opts.Hostname,
+		"namespace":  opts.Namespace,
+		"request_ip": opts.RequestIP,
+		"ipv6":       opts.V6,
+	}).Trace("creating new native DHCP client")
+
+	return &DHCPClient{
+		opts:      opts,
+		ifaceName: iface,
+		stopChan:  make(chan struct{}),
+	}, nil
+}
+
+// Start starts the DHCP client and returns an event channel
+func (c *DHCPClient) Start() (chan Event, error) {
+	events := make(chan Event, 10)
+
+	// Start the DHCP client goroutine
+	go c.runDHCPClient(events)
+
+	return events, nil
+}
+
+// runDHCPClient runs the DHCP client in a separate goroutine with proper namespace handling
+func (c *DHCPClient) runDHCPClient(events chan Event) {
+	defer close(events)
+
+	// Handle network namespace switching if needed
+	if c.opts.Namespace != "" {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		origNS, err := netns.Get()
+		if err != nil {
+			log.WithError(err).Error("Failed to get current namespace")
+			return
+		}
+		defer origNS.Close()
+
+		ns, err := netns.GetFromPath(c.opts.Namespace)
+		if err != nil {
+			log.WithError(err).WithField("namespace", c.opts.Namespace).Error("Failed to open network namespace")
+			return
+		}
+		defer ns.Close()
+
+		if err := netns.Set(ns); err != nil {
+			log.WithError(err).Error("Failed to enter network namespace")
+			return
+		}
+		defer netns.Set(origNS)
+	}
+
+	if c.opts.V6 {
+		c.runDHCPv6Client(events)
+	} else {
+		c.runDHCPv4Client(events)
+	}
+}
+
+// runDHCPv4Client runs the DHCPv4 client
+func (c *DHCPClient) runDHCPv4Client(events chan Event) {
+	// Create the native DHCP client
+	client, err := nclient4.New(c.ifaceName)
+	if err != nil {
+		log.WithError(err).WithField("interface", c.ifaceName).Error("Failed to create DHCPv4 client")
+		return
+	}
+	defer client.Close()
+
+	c.client4 = client
+
+	// Configure DHCP options
+	modifiers := []dhcpv4.Modifier{}
+
+	if c.opts.Hostname != "" {
+		modifiers = append(modifiers, dhcpv4.WithOption(dhcpv4.OptHostName(c.opts.Hostname)))
+	}
+
+	if c.opts.LeaseTime > 0 {
+		modifiers = append(modifiers, dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(c.opts.LeaseTime)))
+	}
+
+	// Add vendor ID for identification
+	modifiers = append(modifiers, dhcpv4.WithOption(dhcpv4.OptClassIdentifier("docker-net-dhcp")))
+
+	ctx := context.Background()
+
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		default:
+		}
+
+		var lease *nclient4.Lease
+		var err error
+
+		// Create a fresh modifiers slice for each request
+		requestModifiers := make([]dhcpv4.Modifier, len(modifiers))
+		copy(requestModifiers, modifiers)
+
+		if c.opts.RequestIP != "" {
+			// Request specific IP
+			requestIP := net.ParseIP(c.opts.RequestIP)
+			if requestIP == nil {
+				log.WithField("request_ip", c.opts.RequestIP).Error("Invalid request IP address")
+				continue
+			}
+
+			requestModifiers = append(requestModifiers, dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(requestIP)))
+			log.WithField("request_ip", c.opts.RequestIP).Debug("Requesting specific IPv4 address")
+		}
+
+		// Attempt to get a DHCP lease
+		lease, err = client.Request(ctx, requestModifiers...)
+		if err != nil {
+			log.WithError(err).Error("DHCPv4 request failed")
+
+			// Send leasefail event
+			events <- Event{
+				Type: "leasefail",
+				Data: Info{},
+			}
+
+			// Wait before retrying
+			select {
+			case <-time.After(10 * time.Second):
+				continue
+			case <-c.stopChan:
+				return
+			}
+		}
+
+		c.lease4 = lease
+		ack := lease.ACK
+
+		// Extract IP information
+		info := Info{
+			IP:      fmt.Sprintf("%s/%d", ack.YourIPAddr.String(), prefixLenFromMask(ack.SubnetMask())),
+			Gateway: "",
+			Domain:  "",
+		}
+
+		// Extract gateway
+		if routers := ack.Router(); len(routers) > 0 {
+			info.Gateway = routers[0].String()
+		}
+
+		// Extract domain
+		if domain := ack.DomainName(); domain != "" {
+			info.Domain = domain
+		}
+
+		log.WithFields(log.Fields{
+			"ip":      info.IP,
+			"gateway": info.Gateway,
+			"domain":  info.Domain,
+		}).Info("DHCPv4 lease acquired")
+
+		// Send bound event
+		events <- Event{
+			Type: "bound",
+			Data: info,
+		}
+
+		// Calculate renewal time (typically 50% of lease time)
+		leaseTime := ack.IPAddressLeaseTime(0)
+		if leaseTime == 0 {
+			leaseTime = 24 * time.Hour // Default 24 hours
+		}
+		renewalTime := leaseTime / 2
+
+		log.WithFields(log.Fields{
+			"lease_time":   leaseTime,
+			"renewal_time": renewalTime,
+		}).Debug("Scheduling DHCPv4 lease renewal")
+
+		// Wait for renewal time or stop signal
+		renewalTimer := time.After(renewalTime)
+
+	renewalLoop:
+		for {
+			select {
+			case <-renewalTimer:
+				// Try to renew the lease
+				newLease, err := client.Renew(ctx, lease, requestModifiers...)
+				if err != nil {
+					log.WithError(err).Warn("DHCPv4 renewal failed, will try to get new lease")
+					break renewalLoop // Break to outer loop to get new lease
+				}
+
+				c.lease4 = newLease
+				newACK := newLease.ACK
+
+				// Extract updated info
+				renewInfo := Info{
+					IP:      fmt.Sprintf("%s/%d", newACK.YourIPAddr.String(), prefixLenFromMask(newACK.SubnetMask())),
+					Gateway: "",
+					Domain:  "",
+				}
+
+				if routers := newACK.Router(); len(routers) > 0 {
+					renewInfo.Gateway = routers[0].String()
+				}
+
+				if domain := newACK.DomainName(); domain != "" {
+					renewInfo.Domain = domain
+				}
+
+				log.WithFields(log.Fields{
+					"ip":      renewInfo.IP,
+					"gateway": renewInfo.Gateway,
+				}).Debug("DHCPv4 lease renewed")
+
+				// Send renewal event
+				events <- Event{
+					Type: "renew",
+					Data: renewInfo,
+				}
+
+				// Update lease and schedule next renewal
+				lease = newLease
+				newLeaseTime := newACK.IPAddressLeaseTime(0)
+				if newLeaseTime == 0 {
+					newLeaseTime = 24 * time.Hour
+				}
+				renewalTimer = time.After(newLeaseTime / 2)
+
+			case <-c.stopChan:
+				return
+			}
+		}
+	}
+}
+
+// runDHCPv6Client runs the DHCPv6 client
+func (c *DHCPClient) runDHCPv6Client(events chan Event) {
+	// Create the native DHCPv6 client
+	client, err := nclient6.New(c.ifaceName)
+	if err != nil {
+		log.WithError(err).WithField("interface", c.ifaceName).Error("Failed to create DHCPv6 client")
+		return
+	}
+	defer client.Close()
+
+	c.client6 = client
+
+	// Configure DHCPv6 options
+	modifiers := []dhcpv6.Modifier{}
+
+	if c.opts.Hostname != "" {
+		// FQDN option for DHCPv6
+		modifiers = append(modifiers, dhcpv6.WithFQDN(0x00, c.opts.Hostname))
+	}
+
+	// Add client identifier for DHCPv6
+	duid := &dhcpv6.DUIDLL{
+		HWType:        1,               // Ethernet
+		LinkLayerAddr: make([]byte, 6), // Will be filled with interface MAC
+	}
+	modifiers = append(modifiers, dhcpv6.WithClientID(duid))
+
+	ctx := context.Background()
+
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		default:
+		}
+
+		// Create a fresh modifiers slice for each request
+		requestModifiers := make([]dhcpv6.Modifier, len(modifiers))
+		copy(requestModifiers, modifiers)
+
+		if c.opts.RequestIP != "" {
+			// Request specific IPv6 address
+			requestIP := net.ParseIP(c.opts.RequestIP)
+			if requestIP == nil || requestIP.To16() == nil {
+				log.WithField("request_ip", c.opts.RequestIP).Error("Invalid request IPv6 address")
+				continue
+			}
+
+			// For DHCPv6, we need to use IANA (Identity Association for Non-temporary Addresses)
+			// We'll request the specific IP through IANA option
+			log.WithField("request_ip", c.opts.RequestIP).Debug("Requesting specific IPv6 address")
+		}
+
+		// Get interface hardware address
+		iface, err := net.InterfaceByName(c.ifaceName)
+		if err != nil {
+			log.WithError(err).WithField("interface", c.ifaceName).Error("Failed to get interface")
+			continue
+		}
+
+		// Create a solicit message
+		solicit, err := dhcpv6.NewSolicit(iface.HardwareAddr, requestModifiers...)
+		if err != nil {
+			log.WithError(err).Error("Failed to create DHCPv6 solicit message")
+			continue
+		}
+
+		// Attempt to get a DHCPv6 lease
+		lease, err := client.Request(ctx, solicit)
+		if err != nil {
+			log.WithError(err).Error("DHCPv6 request failed")
+
+			// Send leasefail event
+			events <- Event{
+				Type: "leasefail",
+				Data: Info{},
+			}
+
+			// Wait before retrying
+			select {
+			case <-time.After(10 * time.Second):
+				continue
+			case <-c.stopChan:
+				return
+			}
+		}
+
+		c.lease6 = lease
+
+		// Extract IPv6 information
+		var ipv6Addr net.IP
+		var prefixLen int = 64 // Default IPv6 prefix length
+
+		// Extract IPv6 address from IANA option
+		if iana := lease.Options.OneIANA(); iana != nil {
+			if addrs := iana.Options.Addresses(); len(addrs) > 0 {
+				ipv6Addr = addrs[0].IPv6Addr
+			}
+		}
+
+		if ipv6Addr == nil {
+			log.Error("No IPv6 address received from DHCPv6 server")
+			continue
+		}
+
+		info := Info{
+			IP:      fmt.Sprintf("%s/%d", ipv6Addr.String(), prefixLen),
+			Gateway: "",
+			Domain:  "",
+		}
+
+		// Extract domain from domain search list
+		if domains := lease.Options.DomainSearchList(); domains != nil && len(domains.Labels) > 0 {
+			info.Domain = domains.Labels[0]
+		}
+
+		log.WithFields(log.Fields{
+			"ip":     info.IP,
+			"domain": info.Domain,
+		}).Info("DHCPv6 lease acquired")
+
+		// Send bound event
+		events <- Event{
+			Type: "bound",
+			Data: info,
+		}
+
+		// Calculate renewal time from IANA option
+		var renewalTime time.Duration = 12 * time.Hour // Default renewal time
+
+		if iana := lease.Options.OneIANA(); iana != nil {
+			if iana.T1 > 0 {
+				renewalTime = time.Duration(iana.T1) * time.Second
+			}
+		}
+
+		log.WithFields(log.Fields{
+			"renewal_time": renewalTime,
+		}).Debug("Scheduling DHCPv6 lease renewal")
+
+		// Wait for renewal time or stop signal
+		renewalTimer := time.After(renewalTime)
+
+	renewalLoop:
+		for {
+			select {
+			case <-renewalTimer:
+				// Try to renew the lease
+				renew, err := dhcpv6.NewMessage()
+				if err != nil {
+					log.WithError(err).Warn("Failed to create DHCPv6 renew message")
+					break renewalLoop // Break to outer loop to get new lease
+				}
+				renew.MessageType = dhcpv6.MessageTypeRenew
+				renew.TransactionID = lease.TransactionID
+
+				// Apply modifiers to the renew message
+				for _, mod := range requestModifiers {
+					mod(renew)
+				}
+
+				newLease, err := client.Request(ctx, renew)
+				if err != nil {
+					log.WithError(err).Warn("DHCPv6 renewal failed, will try to get new lease")
+					break renewalLoop // Break to outer loop to get new lease
+				}
+
+				c.lease6 = newLease
+
+				// Extract updated IPv6 information
+				var newIPv6Addr net.IP
+				if iana := newLease.Options.OneIANA(); iana != nil {
+					if addrs := iana.Options.Addresses(); len(addrs) > 0 {
+						newIPv6Addr = addrs[0].IPv6Addr
+					}
+				}
+
+				if newIPv6Addr == nil {
+					log.Warn("No IPv6 address in DHCPv6 renewal response")
+					break renewalLoop
+				}
+
+				renewInfo := Info{
+					IP:      fmt.Sprintf("%s/%d", newIPv6Addr.String(), prefixLen),
+					Gateway: "",
+					Domain:  "",
+				}
+
+				if domains := newLease.Options.DomainSearchList(); domains != nil && len(domains.Labels) > 0 {
+					renewInfo.Domain = domains.Labels[0]
+				}
+
+				log.WithFields(log.Fields{
+					"ip": renewInfo.IP,
+				}).Debug("DHCPv6 lease renewed")
+
+				// Send renewal event
+				events <- Event{
+					Type: "renew",
+					Data: renewInfo,
+				}
+
+				// Update lease and schedule next renewal
+				lease = newLease
+				newRenewalTime := renewalTime // Keep same renewal interval
+				if iana := newLease.Options.OneIANA(); iana != nil && iana.T1 > 0 {
+					newRenewalTime = time.Duration(iana.T1) * time.Second
+				}
+				renewalTimer = time.After(newRenewalTime)
+
+			case <-c.stopChan:
+				return
+			}
+		}
+	}
+}
+
+// Finish gracefully stops the DHCP client
+func (c *DHCPClient) Finish(ctx context.Context) error {
+	close(c.stopChan)
+
+	var err error
+
+	// Release IPv4 lease if present
+	if c.client4 != nil && c.lease4 != nil {
+		if releaseErr := c.client4.Release(c.lease4); releaseErr != nil {
+			log.WithError(releaseErr).Warn("Failed to release DHCPv4 lease")
+			err = releaseErr
+		} else {
+			log.Debug("DHCPv4 lease released successfully")
+		}
+	}
+
+	// DHCPv6 client doesn't support release method
+	if c.client6 != nil && c.lease6 != nil {
+		log.Debug("DHCPv6 lease will expire naturally (no release method available)")
+	}
+
+	// Close clients
+	if c.client4 != nil {
+		c.client4.Close()
+	}
+	if c.client6 != nil {
+		c.client6.Close()
+	}
+
+	return err
+}
+
+// GetIP is a convenience function that gets a DHCP lease once and returns the info
+func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, error) {
+	client, err := NewDHCPClient(iface, opts)
+	if err != nil {
+		return Info{}, fmt.Errorf("failed to create DHCP client: %w", err)
+	}
+
+	events, err := client.Start()
+	if err != nil {
+		return Info{}, fmt.Errorf("failed to start DHCP client: %w", err)
+	}
+
+	// Wait for bound event or timeout
+	select {
+	case event := <-events:
+		switch event.Type {
+		case "bound":
+			// Clean up the client
+			client.Finish(ctx)
+			return event.Data, nil
+		case "leasefail":
+			client.Finish(ctx)
+			return Info{}, util.ErrNoLease
+		}
+	case <-ctx.Done():
+		client.Finish(ctx)
+		return Info{}, ctx.Err()
+	}
+
+	client.Finish(ctx)
+	return Info{}, util.ErrNoLease
+}
+
+// Helper function to convert subnet mask to prefix length
+func prefixLenFromMask(mask net.IPMask) int {
+	ones, _ := mask.Size()
+	return ones
+}

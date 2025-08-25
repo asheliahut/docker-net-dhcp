@@ -13,7 +13,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/asheliahut/docker-net-dhcp/pkg/udhcpc"
+	"github.com/asheliahut/docker-net-dhcp/pkg/dhcp"
 	"github.com/asheliahut/docker-net-dhcp/pkg/util"
 )
 
@@ -146,7 +146,7 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 	return opts, nil
 }
 
-// CreateEndpoint creates a veth pair and uses udhcpc to acquire an initial IP address on the container end. Docker will
+// CreateEndpoint creates a veth pair and uses DHCP to acquire an initial IP address on the container end. Docker will
 // move the interface into the container's namespace and apply the address.
 func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (CreateEndpointResponse, error) {
 	log.WithField("options", r.Options).Debug("CreateEndpoint options")
@@ -171,11 +171,11 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		if err == nil {
 			break
 		}
-		if err != nil && retries == 0 {
+		if retries == 0 {
 			return res, fmt.Errorf("failed to get network options: %w", err)
 		}
 
-		log.Debugf("failed to get network options [backoff %s]: %w", backoff)
+		log.Debugf("failed to get network options [backoff %s]: %v", backoff, err)
 		retries--
 		time.Sleep(backoff)
 		backoff *= 2
@@ -223,76 +223,116 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			return fmt.Errorf("failed to set container side link of veth pair up: %w", err)
 		}
 
-		// Only write back the MAC address if it wasn't provided to us by libnetwork
-		if r.Interface.MacAddress == "" {
-			// The kernel will often reset a randomly assigned MAC address after actions like LinkSetMaster. We prevent
-			// this behaviour by setting it manually to the random value
-			if err := netlink.LinkSetHardwareAddr(ctrLink, ctrLink.Attrs().HardwareAddr); err != nil {
-				return fmt.Errorf("failed to set container side of veth pair's MAC address: %w", err)
+		// Store the desired MAC address before any operations that might change it
+		var finalMAC net.HardwareAddr
+		if r.Interface.MacAddress != "" {
+			var err error
+			finalMAC, err = net.ParseMAC(r.Interface.MacAddress)
+			if err != nil {
+				return fmt.Errorf("failed to parse provided MAC address: %w", err)
 			}
-
-			res.Interface.MacAddress = ctrLink.Attrs().HardwareAddr.String()
+		} else {
+			// Use the kernel-assigned random MAC address
+			finalMAC = ctrLink.Attrs().HardwareAddr
+			res.Interface.MacAddress = finalMAC.String()
 		}
 
 		if err := netlink.LinkSetMaster(hostLink, bridge); err != nil {
 			return fmt.Errorf("failed to attach host side link of veth peer to bridge: %w", err)
 		}
 
+		// Set MAC address after LinkSetMaster since the kernel often resets it during bridge attachment
+		if err := netlink.LinkSetHardwareAddr(ctrLink, finalMAC); err != nil {
+			return fmt.Errorf("failed to set container side of veth pair's MAC address: %w", err)
+		}
+
+		log.Debug("VP>>>>>> CreateEndpoint 4 - MAC address set, preparing DHCP")
+
 		timeout := defaultLeaseTimeout
 		if opts.LeaseTimeout != 0 {
 			timeout = opts.LeaseTimeout
 		}
-		initialIP := func(v6 bool) error {
-			v6str := ""
-			if v6 {
-				v6str = "v6"
+
+		hostname := ""
+		if r.Options != nil {
+			if idI, ok := r.Options["hostname"]; ok {
+				hostname, _ = idI.(string)
 			}
+		}
 
-			timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
+		// Get IPv4 address via DHCP using consistent MAC address
+		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
 
-			hostname := ""
-			if r.Options != nil {
-				if idI, ok := r.Options["hostname"]; ok {
-					hostname, _ = idI.(string)
-				}
-			}
+		log.WithFields(log.Fields{
+			"interface": ctrName,
+			"hostname":  hostname,
+			"timeout":   timeout,
+			"mac":       finalMAC.String(),
+		}).Debug("[dbg] calling GetIP with interface details")
 
-			info, err := udhcpc.GetIP(timeoutCtx, ctrName, &udhcpc.DHCPClientOptions{
-				V6:       v6,
+		// Get IP address using native DHCP client
+		info, err := dhcp.GetIP(timeoutCtx, ctrName, &dhcp.DHCPClientOptions{
+			Hostname: hostname,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get DHCP IP: %w", err)
+		}
+
+		ipv4, err := netlink.ParseAddr(info.IP)
+		if err != nil {
+			return fmt.Errorf("failed to parse initial IPv4 address: %w", err)
+		}
+
+		hint := p.joinHints[r.EndpointID]
+		res.Interface.Address = info.IP
+		hint.IPv4 = ipv4
+		hint.Gateway = info.Gateway
+		hint.MAC = finalMAC
+
+		// Get IPv6 address if enabled - using native DHCPv6 client
+		if opts.IPv6 {
+			timeoutCtxV6, cancelV6 := context.WithTimeout(ctx, timeout)
+			defer cancelV6()
+
+			infoV6, err := dhcp.GetIP(timeoutCtxV6, ctrName, &dhcp.DHCPClientOptions{
+				V6:       true,
 				Hostname: hostname,
 			})
 			if err != nil {
-				return fmt.Errorf("failed to get initial IP%v address via DHCP%v: %w", v6str, v6str, err)
-			}
-			ip, err := netlink.ParseAddr(info.IP)
-			if err != nil {
-				return fmt.Errorf("failed to parse initial IP%v address: %w", v6str, err)
-			}
+				log.WithError(err).WithFields(log.Fields{
+					"network":  r.NetworkID[:12],
+					"endpoint": r.EndpointID[:12],
+				}).Warn("Failed to get initial IPv6 address via DHCP, skipping IPv6 configuration")
 
-			hint := p.joinHints[r.EndpointID]
-			if v6 {
-				res.Interface.AddressIPv6 = info.IP
-				hint.IPv6 = ip
-				// No gateways in DHCPv6!
+				// Continue without IPv6 - container can use SLAAC or static configuration
+				res.Interface.AddressIPv6 = ""
+				hint.IPv6 = nil
 			} else {
-				res.Interface.Address = info.IP
-				hint.IPv4 = ip
-				hint.Gateway = info.Gateway
-			}
-			p.joinHints[r.EndpointID] = hint
+				ipv6, err := netlink.ParseAddr(infoV6.IP)
+				if err != nil {
+					log.WithError(err).WithFields(log.Fields{
+						"network":  r.NetworkID[:12],
+						"endpoint": r.EndpointID[:12],
+						"ipv6":     infoV6.IP,
+					}).Warn("Failed to parse initial IPv6 address, skipping IPv6 configuration")
 
-			return nil
-		}
+					res.Interface.AddressIPv6 = ""
+					hint.IPv6 = nil
+				} else {
+					res.Interface.AddressIPv6 = infoV6.IP
+					hint.IPv6 = ipv6
 
-		if err := initialIP(false); err != nil {
-			return err
-		}
-		if opts.IPv6 {
-			if err := initialIP(true); err != nil {
-				return err
+					log.WithFields(log.Fields{
+						"network":  r.NetworkID[:12],
+						"endpoint": r.EndpointID[:12],
+						"ipv6":     infoV6.IP,
+					}).Info("IPv6 address acquired via DHCPv6")
+				}
 			}
 		}
+
+		p.joinHints[r.EndpointID] = hint
 
 		return nil
 	}(); err != nil {
@@ -417,8 +457,8 @@ func (p *Plugin) addRoutes(opts *DHCPNetworkOptions, v6 bool, bridge netlink.Lin
 		}
 
 		if route.Protocol == unix.RTPROT_KERNEL ||
-			(family == unix.AF_INET && route.Dst.Contains(hint.IPv4.IP)) ||
-			(family == unix.AF_INET6 && route.Dst.Contains(hint.IPv6.IP)) {
+			(family == unix.AF_INET && hint.IPv4 != nil && route.Dst.Contains(hint.IPv4.IP)) ||
+			(family == unix.AF_INET6 && hint.IPv6 != nil && route.Dst.Contains(hint.IPv6.IP)) {
 			// Make sure to leave out the default on-link route created automatically for the IP(s) acquired by DHCP
 			continue
 		}
@@ -482,6 +522,12 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 			"gateway":  hint.Gateway,
 		}).Info("[Join] Setting IPv4 gateway retrieved from initial DHCP in CreateEndpoint")
 		res.Gateway = hint.Gateway
+	} else {
+		log.WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+			"sandbox":  r.SandboxKey,
+		}).Info("[Join] No initial gateway from CreateEndpoint, persistent DHCP client will handle networking")
 	}
 
 	bridge, err := netlink.LinkByName(opts.Bridge)
@@ -505,6 +551,10 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		m := newDHCPManager(p.docker, r, opts)
 		m.LastIP = hint.IPv4
 		m.LastIPv6 = hint.IPv6
+		m.OriginalMAC = hint.MAC
+
+		// Transfer the initial client to the manager for cleanup
+		// No initial client to clean up since we use one-shot DHCP in CreateEndpoint
 
 		if err := m.Start(ctx); err != nil {
 			log.WithError(err).WithFields(log.Fields{
@@ -535,8 +585,32 @@ func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
 	}
 	delete(p.persistentDHCP, r.EndpointID)
 
-	if err := manager.Stop(); err != nil {
-		return err
+	// Use timeout context for cleanup
+	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Stop manager with timeout
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Stop()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"network":  r.NetworkID[:12],
+				"endpoint": r.EndpointID[:12],
+			}).Warn("Error during manager stop, but continuing")
+		}
+	case <-cleanupCtx.Done():
+		log.WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+		}).Warn("Timeout during manager cleanup, forcing stop")
+
+		// Force cleanup in background
+		go manager.forceCleanup()
 	}
 
 	log.WithFields(log.Fields{

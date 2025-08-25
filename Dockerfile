@@ -14,6 +14,5 @@ FROM alpine:3.22
 RUN mkdir -p /run/docker/plugins
 
 COPY --from=builder /usr/local/src/docker-net-dhcp/bin/net-dhcp /usr/sbin/
-COPY --from=builder /usr/local/src/docker-net-dhcp/bin/udhcpc-handler /usr/lib/net-dhcp/udhcpc-handler
 
 ENTRYPOINT ["/usr/sbin/net-dhcp"]

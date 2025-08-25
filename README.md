@@ -1,7 +1,8 @@
 # docker-net-dhcp
 
 `docker-net-dhcp` is a Docker plugin providing a network driver which allocates IP addresses (IPv4 and optionally IPv6)
-via an existing DHCP server (e.g. your router).
+via an existing DHCP server (e.g. your router). It uses a native Go DHCP client implementation for improved performance,
+reliability, and easier deployment.
 
 When configured correctly, this allows you to spin up a container (e.g. `docker run ...` or `docker-compose up ...`) and
 access it on your network as if it was any other machine! _Probably_ not a great idea for production, but it's pretty
@@ -160,11 +161,11 @@ networks:
 
 Note:
  - It will take a bit longer than usual for the container to start, as a DHCP lease needs to be obtained before creating it
- - Once created, a persistent DHCP client will renew the DHCP lease (and then update the default gateway in the
-   container) when necessary - **this client runs separately from the container**
+ - Once created, a persistent native Go DHCP client will renew the DHCP lease (and update routing in the container) when 
+   necessary - **this client runs in the plugin process, separate from the container**
  - Use `--mac-address` to specify a MAC address if you've configured reserved IP addresses on your DHCP server, or if
    you want a container to re-use an old lease
- - Add `--hostname my-host` to have the DHCP transmit this name as the host for the container. This is useful if your
+ - Add `--hostname my-host` to have the DHCP client transmit this name as the hostname for the container. This is useful if your
    DHCP server is configured to update DNS records from DHCP leases.
  - If the `docker run` command times out waiting for a lease, you can try increasing the initial timeout value by
    passing `-o lease_timeout=60s` when creating the network (e.g. to increase to 60 seconds)
@@ -189,16 +190,31 @@ connect each container's network namespace to the bridge.
   on the host, bridged with the desired local network.
 - Instead of allocating IP addresses from a static pool stored on the Docker host, `net-dhcp` relies on an external DHCP
   server to provide IP addresses
+- Uses a native Go DHCP client implementation based on `github.com/insomniacslk/dhcp` for improved performance and reliability
+
+## Architecture Features
+
+- **Native Go DHCP Client**: No external dependencies on BusyBox utilities
+- **Container Lifecycle Tracking**: Monitors Docker events to automatically clean up resources when containers stop
+- **Atomic IP Assignment**: Ensures IP addresses are assigned without conflicts
+- **Enhanced Error Handling**: Comprehensive error recovery and retry logic for network operations
+- **Resource Management**: Automatic cleanup of stale resources with timeout mechanisms
+- **IP Conflict Detection**: Verifies IP addresses aren't already in use before assignment
 
 ## Flow
 
-1. Container creation request is made
-2. A `veth` pair is created and the host end is connected to the bridge (at this point both interfaces are still in the
-host namespace)
-3. A DHCP client (BusyBox `udhcpc`) is started on the container end (still in the host namespace) - initial IP address
-is provided to Docker by the plugin
-4. Docker moves the container end of the `veth` pair into the container's network namespace and sets the IP address - at
-this point `udhcpc` must be stopped
-5. `net-dhcp` starts `udhcpc` on the container end of the `veth` pair in the container's **network namespace** (but
-still in the plugin **PID namespace** - this means that the container can't see the DHCP client)
-6. `udhcpc` continues to run, renewing the lease when required, until the container shuts down
+1. **Container Creation**: Request is made to create a container
+2. **veth Pair Setup**: A `veth` pair is created and the host end is connected to the bridge (both interfaces start in host namespace)
+3. **Initial DHCP**: Native Go DHCP client obtains initial IP address on the container interface (still in host namespace)
+4. **Namespace Move**: Docker moves the container end of the `veth` pair into the container's network namespace and applies the IP address
+5. **Persistent DHCP**: Plugin starts a persistent native Go DHCP client in the container's network namespace to maintain the lease
+6. **Lease Management**: DHCP client continues running in the plugin process, automatically renewing leases and updating routes until the container shuts down
+7. **Cleanup**: Container lifecycle monitoring ensures resources are cleaned up when the container stops
+
+## Benefits of Native Implementation
+
+- **Single Binary**: No dependency on external DHCP utilities
+- **Better Integration**: Direct integration with Go networking libraries
+- **Enhanced Reliability**: Built-in retry logic and error recovery
+- **Resource Efficiency**: Lower memory footprint and faster startup
+- **Simplified Deployment**: Easier to package and distribute

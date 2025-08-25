@@ -1,9 +1,11 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -14,7 +16,7 @@ import (
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 
-	"github.com/asheliahut/docker-net-dhcp/pkg/udhcpc"
+	"github.com/asheliahut/docker-net-dhcp/pkg/dhcp"
 	"github.com/asheliahut/docker-net-dhcp/pkg/util"
 )
 
@@ -25,8 +27,9 @@ type dhcpManager struct {
 	joinReq JoinRequest
 	opts    DHCPNetworkOptions
 
-	LastIP   *netlink.Addr
-	LastIPv6 *netlink.Addr
+	LastIP      *netlink.Addr
+	LastIPv6    *netlink.Addr
+	OriginalMAC net.HardwareAddr // MAC address from CreateEndpoint
 
 	nsPath    string
 	hostname  string
@@ -34,9 +37,10 @@ type dhcpManager struct {
 	netHandle *netlink.Handle
 	ctrLink   netlink.Link
 
-	stopChan  chan struct{}
-	errChan   chan error
-	errChanV6 chan error
+	stopChan     chan struct{}
+	errChan      chan error
+	errChanV6    chan error
+	cleanupTimer *time.Timer
 }
 
 func newDHCPManager(docker *docker.Client, r JoinRequest, opts DHCPNetworkOptions) *dhcpManager {
@@ -58,7 +62,41 @@ func (m *dhcpManager) logFields(v6 bool) log.Fields {
 	}
 }
 
-func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
+func (m *dhcpManager) handleBound(v6 bool, info dhcp.Info) error {
+	ip, err := netlink.ParseAddr(info.IP)
+	if err != nil {
+		return fmt.Errorf("failed to parse IP address: %w", err)
+	}
+
+	// Check for IP conflicts before assignment
+	if err := m.checkIPConflict(ip, v6); err != nil {
+		return fmt.Errorf("IP conflict detected: %w", err)
+	}
+
+	// Set the IP address on the interface with atomic operation
+	if err := m.atomicAddrAdd(ip); err != nil {
+		return fmt.Errorf("failed to add IP address to interface: %w", err)
+	}
+
+	// Update our stored IP address
+	if v6 {
+		m.LastIPv6 = ip
+	} else {
+		m.LastIP = ip
+
+		// Set up default route for IPv4
+		if info.Gateway != "" {
+			gateway := net.ParseIP(info.Gateway)
+			if err := m.atomicRouteAdd(gateway); err != nil {
+				return fmt.Errorf("failed to add default route: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *dhcpManager) renew(v6 bool, info dhcp.Info) error {
 	lastIP := m.LastIP
 	if v6 {
 		lastIP = m.LastIPv6
@@ -69,13 +107,22 @@ func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 		return fmt.Errorf("failed to parse IP address: %w", err)
 	}
 
+	// Handle case where there was no initial IP (lastIP is nil)
+	if lastIP == nil {
+		log.
+			WithFields(m.logFields(v6)).
+			WithField("new_ip", ip).
+			Info("DHCP renew with no previous IP, treating as initial bind")
+		return m.handleBound(v6, info)
+	}
+
 	if !ip.Equal(*lastIP) {
 		// TODO: We can't deal with a different renewed IP for the same reason as described for `bound`
 		log.
 			WithFields(m.logFields(v6)).
 			WithField("old_ip", lastIP).
 			WithField("new_ip", ip).
-			Warn("udhcpc renew with changed IP")
+			Warn("DHCP renew with changed IP")
 	}
 
 	if !v6 && info.Gateway != "" {
@@ -93,7 +140,7 @@ func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 			log.
 				WithFields(m.logFields(v6)).
 				WithField("gateway", newGateway).
-				Info("udhcpc renew adding default route")
+				Info("DHCP renew adding default route")
 
 			if err := m.netHandle.RouteAdd(&netlink.Route{
 				LinkIndex: m.ctrLink.Attrs().Index,
@@ -106,7 +153,7 @@ func (m *dhcpManager) renew(v6 bool, info udhcpc.Info) error {
 				WithFields(m.logFields(v6)).
 				WithField("old_gateway", routes[0].Gw).
 				WithField("new_gateway", newGateway).
-				Info("udhcpc renew replacing default route")
+				Info("DHCP renew replacing default route")
 
 			routes[0].Gw = newGateway
 			if err := m.netHandle.RouteReplace(&routes[0]); err != nil {
@@ -126,13 +173,33 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 
 	log.
 		WithFields(m.logFields(v6)).
-		Info("Starting persistent DHCP client")
+		Info("Starting persistent native DHCP client")
 
-	client, err := udhcpc.NewDHCPClient(m.ctrLink.Attrs().Name, &udhcpc.DHCPClientOptions{
+	options := &dhcp.DHCPClientOptions{
 		Hostname:  m.hostname,
 		V6:        v6,
 		Namespace: m.nsPath,
-	})
+	}
+
+	// If we have an existing IP from CreateEndpoint, request the same IP for renewal
+	lastIP := m.LastIP
+	if v6 {
+		lastIP = m.LastIPv6
+	}
+	if lastIP != nil {
+		// Extract just the IP address without the CIDR suffix
+		ipStr := lastIP.IP.String()
+		options.RequestIP = ipStr
+		log.WithFields(log.Fields{
+			"network":    m.joinReq.NetworkID[:12],
+			"endpoint":   m.joinReq.EndpointID[:12],
+			"sandbox":    m.joinReq.SandboxKey,
+			"is_ipv6":    v6,
+			"request_ip": ipStr,
+		}).Info("Configuring persistent DHCP client to request existing IP")
+	}
+
+	client, err := dhcp.NewDHCPClient(m.ctrLink.Attrs().Name, options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DHCP%v client: %w", v6Str, err)
 	}
@@ -144,35 +211,37 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 
 	errChan := make(chan error)
 	go func() {
+		defer close(errChan)
+
 		for {
 			select {
-			case event := <-events:
-				switch event.Type {
-				// TODO: We can't really allow the IP in the container to be deleted, it'll delete some of our previously
-				// copied routes. Should this be handled somehow?
-				//case "deconfig":
-				//	ip := m.LastIP
-				//	if v6 {
-				//		ip = m.LastIPv6
-				//	}
+			case event, ok := <-events:
+				if !ok {
+					// Events channel closed, DHCP client stopped
+					return
+				}
 
-				//	log.
-				//		WithFields(m.logFields(v6)).
-				//		WithField("ip", ip).
-				//		Info("udhcpc deconfiguring, deleting previously acquired IP")
-				//	if err := m.netHandle.AddrDel(m.ctrLink, ip); err != nil {
-				//		log.
-				//			WithError(err).
-				//			WithFields(m.logFields(v6)).
-				//			WithField("ip", ip).
-				//			Error("Failed to delete existing udhcpc address")
-				//	}
-				// We're `bound` from the beginning
-				//case "bound":
+				switch event.Type {
+				case "bound":
+					log.
+						WithFields(m.logFields(v6)).
+						WithField("ip", event.Data.IP).
+						WithField("gateway", event.Data.Gateway).
+						Info("native DHCP client bound to new IP address")
+
+					// Handle initial IP assignment when no IP was previously acquired
+					if err := m.handleBound(v6, event.Data); err != nil {
+						log.
+							WithError(err).
+							WithFields(m.logFields(v6)).
+							WithField("gateway", event.Data.Gateway).
+							WithField("new_ip", event.Data.IP).
+							Error("Failed to handle IP binding")
+					}
 				case "renew":
 					log.
 						WithFields(m.logFields(v6)).
-						Debug("udhcpc renew")
+						Debug("native DHCP client renew")
 
 					if err := m.renew(v6, event.Data); err != nil {
 						log.
@@ -183,20 +252,19 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 							Error("Failed to execute IP renewal")
 					}
 				case "leasefail":
-					log.WithFields(m.logFields(v6)).Warn("udhcpc failed to get a lease")
-				case "nak":
-					log.WithFields(m.logFields(v6)).Warn("udhcpc client received NAK")
+					log.WithFields(m.logFields(v6)).Warn("native DHCP client failed to get a lease")
 				}
 
 			case <-m.stopChan:
 				log.
 					WithFields(m.logFields(v6)).
-					Info("Shutting down persistent DHCP client")
+					Info("Shutting down persistent native DHCP client")
 
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 
-				errChan <- client.Finish(ctx)
+				err := client.Finish(ctx)
+				errChan <- err
 				return
 			}
 		}
@@ -206,6 +274,16 @@ func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
 }
 
 func (m *dhcpManager) Start(ctx context.Context) error {
+	// Set up cleanup timer for resource management
+	m.cleanupTimer = time.AfterFunc(30*time.Minute, func() {
+		log.WithFields(m.logFields(false)).Warn("DHCP manager cleanup timer expired, forcing cleanup")
+		m.forceCleanup()
+	})
+	defer func() {
+		if m.cleanupTimer != nil {
+			m.cleanupTimer.Stop()
+		}
+	}()
 	var ctrID string
 	if err := util.AwaitCondition(ctx, func() (bool, error) {
 		dockerNet, err := m.docker.NetworkInspect(ctx, m.joinReq.NetworkID, dTypes.NetworkInspectOptions{})
@@ -238,14 +316,15 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 	m.nsPath = fmt.Sprintf("/proc/%v/ns/net", ctr.State.Pid)
 	m.hostname = ctr.Config.Hostname
 
-	m.nsHandle, err = util.AwaitNetNS(ctx, m.nsPath, pollTime)
+	// Enhanced namespace handling with retries and validation
+	m.nsHandle, err = m.safeAwaitNetNS(ctx, m.nsPath, pollTime)
 	if err != nil {
 		return fmt.Errorf("failed to get sandbox network namespace: %w", err)
 	}
 
-	m.netHandle, err = netlink.NewHandleAt(m.nsHandle)
+	m.netHandle, err = m.safeCreateNetHandle(m.nsHandle)
 	if err != nil {
-		m.nsHandle.Close()
+		m.safeCloseNSHandle()
 		return fmt.Errorf("failed to open netlink handle in sandbox namespace: %w", err)
 	}
 
@@ -276,6 +355,69 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 			return err
 		}
 
+		// Restore the original MAC address to ensure consistent DHCP requests
+		currentMAC := m.ctrLink.Attrs().HardwareAddr
+		log.WithFields(log.Fields{
+			"network":     m.joinReq.NetworkID[:12],
+			"endpoint":    m.joinReq.EndpointID[:12],
+			"sandbox":     m.joinReq.SandboxKey,
+			"current_mac": currentMAC.String(),
+			"original_mac": func() string {
+				if m.OriginalMAC != nil {
+					return m.OriginalMAC.String()
+				} else {
+					return "<nil>"
+				}
+			}(),
+		}).Info("MAC address check before persistent DHCP client")
+
+		if m.OriginalMAC != nil {
+			if !bytes.Equal(currentMAC, m.OriginalMAC) {
+				log.WithFields(log.Fields{
+					"network":      m.joinReq.NetworkID[:12],
+					"endpoint":     m.joinReq.EndpointID[:12],
+					"sandbox":      m.joinReq.SandboxKey,
+					"current_mac":  currentMAC.String(),
+					"original_mac": m.OriginalMAC.String(),
+				}).Info("Restoring original MAC address for consistent DHCP requests")
+
+				if err := m.netHandle.LinkSetHardwareAddr(m.ctrLink, m.OriginalMAC); err != nil {
+					return fmt.Errorf("failed to restore original MAC address: %w", err)
+				}
+
+				// Verify the MAC was actually set and refresh the link handle
+				if linkRefresh, err := m.netHandle.LinkByIndex(m.ctrLink.Attrs().Index); err == nil {
+					m.ctrLink = linkRefresh
+				}
+
+				verifyMAC := m.ctrLink.Attrs().HardwareAddr
+				log.WithFields(log.Fields{
+					"network":    m.joinReq.NetworkID[:12],
+					"endpoint":   m.joinReq.EndpointID[:12],
+					"sandbox":    m.joinReq.SandboxKey,
+					"verify_mac": verifyMAC.String(),
+				}).Info("MAC address after restoration")
+
+				// Brief delay to ensure network stack processes MAC change
+				time.Sleep(100 * time.Millisecond)
+			} else {
+				log.WithFields(log.Fields{
+					"network":  m.joinReq.NetworkID[:12],
+					"endpoint": m.joinReq.EndpointID[:12],
+					"sandbox":  m.joinReq.SandboxKey,
+					"mac":      currentMAC.String(),
+				}).Info("MAC address already matches, no restoration needed")
+			}
+		} else {
+			log.WithFields(log.Fields{
+				"network":  m.joinReq.NetworkID[:12],
+				"endpoint": m.joinReq.EndpointID[:12],
+				"sandbox":  m.joinReq.SandboxKey,
+			}).Warn("OriginalMAC is nil, cannot restore MAC address")
+		}
+
+		// No initial client to clean up since CreateEndpoint uses one-shot DHCP
+
 		if m.errChan, err = m.setupClient(false); err != nil {
 			close(m.stopChan)
 			return err
@@ -290,8 +432,7 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 
 		return nil
 	}(); err != nil {
-		m.netHandle.Delete()
-		m.nsHandle.Close()
+		m.safeCleanupResources()
 		return err
 	}
 
@@ -299,17 +440,262 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 }
 
 func (m *dhcpManager) Stop() error {
-	defer m.nsHandle.Close()
-	defer m.netHandle.Delete()
+	defer m.safeCleanupResources()
 
-	close(m.stopChan)
-
-	if err := <-m.errChan; err != nil {
-		return fmt.Errorf("failed shut down DHCP client: %w", err)
+	// Stop cleanup timer
+	if m.cleanupTimer != nil {
+		m.cleanupTimer.Stop()
 	}
-	if m.opts.IPv6 {
-		if err := <-m.errChanV6; err != nil {
-			return fmt.Errorf("failed shut down DHCPv6 client: %w", err)
+
+	// Safely signal stop
+	m.safeStop()
+
+	// Wait for DHCP clients to shut down with timeout
+	if err := m.awaitClientShutdown(10 * time.Second); err != nil {
+		return fmt.Errorf("failed to shut down DHCP clients: %w", err)
+	}
+
+	return nil
+}
+
+// checkIPConflict verifies that the IP address is not already in use
+func (m *dhcpManager) checkIPConflict(addr *netlink.Addr, v6 bool) error {
+	family := unix.AF_INET
+	if v6 {
+		family = unix.AF_INET6
+	}
+
+	// Get all addresses on the interface
+	existingAddrs, err := m.netHandle.AddrList(m.ctrLink, family)
+	if err != nil {
+		return fmt.Errorf("failed to list existing addresses: %w", err)
+	}
+
+	// Check for exact matches
+	for _, existing := range existingAddrs {
+		if existing.Equal(*addr) {
+			log.WithFields(m.logFields(v6)).WithField("ip", addr.IP.String()).Debug("IP address already assigned, skipping")
+			return nil // Not an error if it's already our address
+		}
+		if existing.IP.Equal(addr.IP) {
+			return fmt.Errorf("IP %s already assigned with different prefix", addr.IP.String())
+		}
+	}
+
+	// Check if IP is reachable on the network (ARP/NDP check)
+	if err := m.checkIPReachability(addr.IP); err != nil {
+		return fmt.Errorf("IP conflict check failed: %w", err)
+	}
+
+	return nil
+}
+
+// checkIPReachability performs basic reachability check to detect IP conflicts
+func (m *dhcpManager) checkIPReachability(ip net.IP) error {
+	// For IPv4, we could implement ARP check
+	// For IPv6, we could implement NDP check
+	// For now, we'll do a simple ping test with short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", ip.String())
+	if err := cmd.Run(); err == nil {
+		return fmt.Errorf("IP %s is already in use (ping successful)", ip.String())
+	}
+
+	return nil
+}
+
+// atomicAddrAdd adds an IP address with conflict resolution
+func (m *dhcpManager) atomicAddrAdd(addr *netlink.Addr) error {
+	// First, try to add the address
+	if err := m.netHandle.AddrAdd(m.ctrLink, addr); err != nil {
+		// Check if it's just a duplicate address
+		if strings.Contains(err.Error(), "file exists") ||
+			strings.Contains(err.Error(), "cannot assign") {
+			// Verify it's actually our address
+			existingAddrs, listErr := m.netHandle.AddrList(m.ctrLink, unix.AF_INET)
+			if listErr != nil {
+				return fmt.Errorf("failed to verify existing address: %w", listErr)
+			}
+
+			for _, existing := range existingAddrs {
+				if existing.Equal(*addr) {
+					log.WithFields(m.logFields(false)).WithField("ip", addr.IP.String()).Debug("Address already exists and matches")
+					return nil
+				}
+			}
+			return fmt.Errorf("address conflict: %w", err)
+		}
+		return fmt.Errorf("failed to add address: %w", err)
+	}
+
+	return nil
+}
+
+// atomicRouteAdd adds a route with conflict resolution
+func (m *dhcpManager) atomicRouteAdd(gateway net.IP) error {
+	route := &netlink.Route{
+		LinkIndex: m.ctrLink.Attrs().Index,
+		Gw:        gateway,
+	}
+
+	if err := m.netHandle.RouteAdd(route); err != nil {
+		if strings.Contains(err.Error(), "file exists") {
+			// Check if existing route matches
+			existingRoutes, listErr := m.netHandle.RouteListFiltered(unix.AF_INET, &netlink.Route{
+				LinkIndex: m.ctrLink.Attrs().Index,
+				Dst:       nil,
+			}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_DST)
+			if listErr != nil {
+				return fmt.Errorf("failed to verify existing route: %w", listErr)
+			}
+
+			for _, existing := range existingRoutes {
+				if existing.Gw != nil && existing.Gw.Equal(gateway) {
+					log.WithFields(m.logFields(false)).WithField("gateway", gateway.String()).Debug("Route already exists and matches")
+					return nil
+				}
+			}
+
+			// Replace existing default route
+			if len(existingRoutes) > 0 {
+				existingRoutes[0].Gw = gateway
+				if err := m.netHandle.RouteReplace(&existingRoutes[0]); err != nil {
+					return fmt.Errorf("failed to replace existing route: %w", err)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("failed to add route: %w", err)
+	}
+
+	return nil
+}
+
+// forceCleanup performs emergency cleanup of resources
+func (m *dhcpManager) forceCleanup() {
+	log.WithFields(m.logFields(false)).Info("Performing forced cleanup of DHCP manager resources")
+
+	if m.netHandle != nil {
+		m.netHandle.Delete()
+		m.netHandle = nil
+	}
+
+	if m.nsHandle.IsOpen() {
+		m.nsHandle.Close()
+	}
+
+	// Send stop signal if channels are still open
+	select {
+	case <-m.stopChan:
+		// Already stopped
+	default:
+		close(m.stopChan)
+	}
+}
+
+// safeAwaitNetNS safely waits for network namespace with enhanced error handling
+func (m *dhcpManager) safeAwaitNetNS(ctx context.Context, nsPath string, pollInterval time.Duration) (netns.NsHandle, error) {
+	retryCount := 0
+	maxRetries := 10
+
+	return util.AwaitNetNSWithRetry(ctx, nsPath, pollInterval, func(err error) bool {
+		retryCount++
+
+		log.WithFields(m.logFields(false)).WithFields(log.Fields{
+			"retry":   retryCount,
+			"ns_path": nsPath,
+			"error":   err.Error(),
+		}).Debug("Network namespace access attempt failed")
+
+		// Continue retrying for certain errors
+		if retryCount >= maxRetries {
+			return false
+		}
+
+		// Retry on common transient errors
+		if strings.Contains(err.Error(), "no such file") ||
+			strings.Contains(err.Error(), "permission denied") ||
+			strings.Contains(err.Error(), "resource temporarily unavailable") {
+			time.Sleep(time.Duration(retryCount) * 100 * time.Millisecond)
+			return true
+		}
+
+		return false
+	})
+}
+
+// safeCreateNetHandle safely creates a netlink handle with error handling
+func (m *dhcpManager) safeCreateNetHandle(nsHandle netns.NsHandle) (*netlink.Handle, error) {
+	handle, err := netlink.NewHandleAt(nsHandle)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create netlink handle: %w", err)
+	}
+
+	// Validate the handle by attempting a simple operation
+	if _, err := handle.LinkList(); err != nil {
+		handle.Delete()
+		return nil, fmt.Errorf("netlink handle validation failed: %w", err)
+	}
+
+	return handle, nil
+}
+
+// safeCloseNSHandle safely closes namespace handle
+func (m *dhcpManager) safeCloseNSHandle() {
+	if m.nsHandle.IsOpen() {
+		if err := m.nsHandle.Close(); err != nil {
+			log.WithFields(m.logFields(false)).WithError(err).Warn("Failed to close namespace handle")
+		}
+	}
+}
+
+// safeCleanupResources safely cleans up all resources
+func (m *dhcpManager) safeCleanupResources() {
+	if m.netHandle != nil {
+		m.netHandle.Delete()
+		m.netHandle = nil
+	}
+	m.safeCloseNSHandle()
+}
+
+// safeStop safely signals stop to goroutines
+func (m *dhcpManager) safeStop() {
+	select {
+	case <-m.stopChan:
+		// Already stopped
+	default:
+		close(m.stopChan)
+	}
+}
+
+// awaitClientShutdown waits for DHCP clients to shut down with timeout
+func (m *dhcpManager) awaitClientShutdown(timeout time.Duration) error {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Wait for IPv4 client
+	if m.errChan != nil {
+		select {
+		case err := <-m.errChan:
+			if err != nil {
+				log.WithFields(m.logFields(false)).WithError(err).Warn("IPv4 DHCP client shutdown error")
+			}
+		case <-shutdownCtx.Done():
+			return fmt.Errorf("timeout waiting for IPv4 DHCP client shutdown")
+		}
+	}
+
+	// Wait for IPv6 client if enabled
+	if m.opts.IPv6 && m.errChanV6 != nil {
+		select {
+		case err := <-m.errChanV6:
+			if err != nil {
+				log.WithFields(m.logFields(true)).WithError(err).Warn("IPv6 DHCP client shutdown error")
+			}
+		case <-shutdownCtx.Done():
+			return fmt.Errorf("timeout waiting for IPv6 DHCP client shutdown")
 		}
 	}
 

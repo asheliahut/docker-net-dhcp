@@ -64,3 +64,43 @@ func AwaitLinkByIndex(ctx context.Context, handle *netlink.Handle, index int, in
 		return dummy, ctx.Err()
 	}
 }
+
+// AwaitNetNSWithRetry waits for network namespace with custom retry logic
+func AwaitNetNSWithRetry(ctx context.Context, path string, interval time.Duration, shouldRetry func(error) bool) (netns.NsHandle, error) {
+	var lastErr error
+	nsChan := make(chan netns.NsHandle)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				ns, err := netns.GetFromPath(path)
+				if err == nil {
+					nsChan <- ns
+					return
+				}
+
+				lastErr = err
+				if !shouldRetry(err) {
+					return
+				}
+
+				time.Sleep(interval)
+			}
+		}
+	}()
+
+	var dummy netns.NsHandle
+	select {
+	case ns := <-nsChan:
+		return ns, nil
+	case <-ctx.Done():
+		if lastErr != nil {
+			log.WithError(lastErr).WithField("path", path).Error("Failed to await network namespace with retry")
+			return dummy, lastErr
+		}
+		return dummy, ctx.Err()
+	}
+}

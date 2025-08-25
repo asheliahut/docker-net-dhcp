@@ -16,8 +16,8 @@ var (
 	ErrBridgeUsed = errors.New("bridge already in use by Docker")
 	// ErrMACAddress indicates an invalid MAC address
 	ErrMACAddress = errors.New("invalid MAC address")
-	// ErrNoLease indicates a DHCP lease was not obtained from udhcpc
-	ErrNoLease = errors.New("udhcpc did not output a lease")
+	// ErrNoLease indicates a DHCP lease was not obtained
+	ErrNoLease = errors.New("DHCP client did not obtain a lease")
 	// ErrNoHint indicates missing state from the CreateEndpoint stage in Join
 	ErrNoHint = errors.New("missing CreateEndpoint hints")
 	// ErrNotVEth indicates a host link was unexpectedly not a veth interface
