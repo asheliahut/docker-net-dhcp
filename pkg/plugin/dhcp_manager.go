@@ -197,7 +197,7 @@ func (m *dhcpManager) setupClientFromLease(leaseInfo *dhcp.LeaseInfo) (chan erro
 	errChan := make(chan error)
 	go func() {
 		defer close(errChan)
-		
+
 		for {
 			select {
 			case event, ok := <-events:
@@ -205,7 +205,7 @@ func (m *dhcpManager) setupClientFromLease(leaseInfo *dhcp.LeaseInfo) (chan erro
 					// Events channel closed, DHCP client stopped
 					return
 				}
-				
+
 				switch event.Type {
 				case "bound":
 					log.WithFields(m.logFields(v6)).WithField("ip", event.Data.IP).WithField("gateway", event.Data.Gateway).Info("Transferred DHCP client confirmed lease binding")
@@ -527,6 +527,42 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 				close(m.stopChan)
 				return err
 			}
+		}
+
+		// Register hostname with DHCP server now that we're in the container namespace
+		if m.hostname != "" && m.LastIP != nil {
+			log.WithFields(log.Fields{
+				"network":   m.joinReq.NetworkID[:12],
+				"endpoint":  m.joinReq.EndpointID[:12],
+				"sandbox":   m.joinReq.SandboxKey,
+				"hostname":  m.hostname,
+				"ip":        m.LastIP.String(),
+				"interface": m.ctrLink.Attrs().Name,
+				"namespace": m.nsPath,
+			}).Info("DHCP Manager: Registering hostname with DHCP server")
+
+			regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
+			if err := dhcp.RegisterHostnameWithNamespace(regCtx, m.ctrLink.Attrs().Name, m.LastIP.String(), m.hostname, m.nsPath); err != nil {
+				log.WithError(err).WithFields(log.Fields{
+					"network":   m.joinReq.NetworkID[:12],
+					"endpoint":  m.joinReq.EndpointID[:12],
+					"sandbox":   m.joinReq.SandboxKey,
+					"hostname":  m.hostname,
+					"ip":        m.LastIP.String(),
+					"interface": m.ctrLink.Attrs().Name,
+				}).Warn("DHCP Manager: Failed to register hostname with DHCP server")
+			}
+			regCancel()
+		} else {
+			log.WithFields(log.Fields{
+				"network":        m.joinReq.NetworkID[:12],
+				"endpoint":       m.joinReq.EndpointID[:12],
+				"sandbox":        m.joinReq.SandboxKey,
+				"hostname":       m.hostname,
+				"hostname_empty": m.hostname == "",
+				"last_ip":        m.LastIP,
+				"last_ip_nil":    m.LastIP == nil,
+			}).Debug("DHCP Manager: Skipping hostname registration - conditions not met")
 		}
 
 		return nil

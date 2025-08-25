@@ -628,34 +628,27 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		ctx, cancel := context.WithTimeout(context.Background(), p.awaitTimeout)
 		defer cancel()
 
+		log.WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+			"sandbox":  r.SandboxKey,
+			"hostname": hostname,
+		}).Debug("[Join] Starting DHCP manager goroutine")
+
 		m := newDHCPManager(p.docker, r, opts, hostname)
 		m.LastIP = hint.IPv4
 		m.LastIPv6 = hint.IPv6
 		m.OriginalMAC = hint.MAC
 
-		// Register hostname with DHCP server if we have a hostname and an IPv4 address
-		if hostname != "" && hint.IPv4 != nil {
-			_, ctrName := vethPairNames(r.EndpointID)
-			currentIP := hint.IPv4.String()
-
-			log.WithFields(log.Fields{
-				"network":  r.NetworkID[:12],
-				"endpoint": r.EndpointID[:12],
-				"sandbox":  r.SandboxKey,
-				"hostname": hostname,
-				"ip":       currentIP,
-			}).Info("[Join] Registering hostname with DHCP server")
-
-			if err := dhcp.RegisterHostname(ctx, ctrName, currentIP, hostname); err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"network":  r.NetworkID[:12],
-					"endpoint": r.EndpointID[:12],
-					"sandbox":  r.SandboxKey,
-					"hostname": hostname,
-					"ip":       currentIP,
-				}).Warn("[Join] Failed to register hostname with DHCP server")
-			}
-		}
+		log.WithFields(log.Fields{
+			"network":        r.NetworkID[:12],
+			"endpoint":       r.EndpointID[:12],
+			"sandbox":        r.SandboxKey,
+			"hostname":       hostname,
+			"hostname_empty": hostname == "",
+			"hint_ipv4":      hint.IPv4,
+			"hint_ipv4_nil":  hint.IPv4 == nil,
+		}).Debug("[Join] DHCP manager will handle hostname registration in container namespace")
 
 		// Transfer the initial client to the manager for lease handoff
 		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
