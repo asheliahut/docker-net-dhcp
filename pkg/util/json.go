@@ -3,6 +3,7 @@ package util
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	log "github.com/sirupsen/logrus"
@@ -58,4 +59,10 @@ func ParseJSONBody(v interface{}, w http.ResponseWriter, r *http.Request) error 
 	}
 
 	return nil
+}
+
+// DecodeJSONStream decodes a JSON object from a stream
+func DecodeJSONStream(reader io.Reader, v interface{}) error {
+	decoder := json.NewDecoder(reader)
+	return decoder.Decode(v)
 }

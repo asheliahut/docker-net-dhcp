@@ -1,5 +1,5 @@
 {
-    "description": "Docker host bridge DHCP networking",
+    "description": "Docker host bridge DHCP networking with native Go DHCP client",
     "interface": {
         "socket": "net-dhcp.sock",
         "types": [
