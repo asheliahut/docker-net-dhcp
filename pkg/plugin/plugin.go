@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"regexp"
 	"time"
 
@@ -384,21 +383,24 @@ func (p *Plugin) isManagerStale(manager *dhcpManager) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Check if the container still exists
-	_, err := p.docker.ContainerInspect(ctx, manager.joinReq.SandboxKey)
+	// Check if there's still a container using this manager's endpoint by inspecting the network
+	dockerNet, err := p.docker.NetworkInspect(ctx, manager.joinReq.NetworkID, network.InspectOptions{})
 	if err != nil {
-		// If we can't inspect the container, it's likely gone
+		log.WithError(err).WithField("network", manager.joinReq.NetworkID[:12]).Warn("Failed to inspect network for staleness check")
+		// If we can't inspect the network, assume the manager might be stale
 		return true
 	}
 
-	// Check if network namespace still exists
-	if manager.nsPath != "" {
-		if _, err := os.Stat(manager.nsPath); os.IsNotExist(err) {
-			return true
+	// Check if any container is still using this endpoint
+	for _, info := range dockerNet.Containers {
+		if info.EndpointID == manager.joinReq.EndpointID {
+			// Found a container still using this endpoint, manager is not stale
+			return false
 		}
 	}
 
-	return false
+	// No container found using this endpoint, manager is stale
+	return true
 }
 
 // cleanupAllManagers cleans up all managers with timeout
