@@ -612,8 +612,8 @@ func RegisterHostname(ctx context.Context, iface string, currentIP string, hostn
 	return RegisterHostnameWithNamespace(ctx, iface, currentIP, hostname, "")
 }
 
-// RegisterHostnameWithNamespace performs a DHCP request to register hostname with the DHCP server in a specific namespace
-// This forces a new DHCP REQUEST message to be sent with the hostname option
+// RegisterHostnameWithNamespace performs a DHCP INFORM to register hostname with the DHCP server in a specific namespace
+// This sends a DHCP INFORM message which is specifically for updating hostname without getting a new lease
 func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP string, hostname string, namespace string) error {
 	if hostname == "" {
 		log.WithField("interface", iface).Debug("RegisterHostname: hostname is empty, skipping")
@@ -625,28 +625,90 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		"hostname":  hostname,
 		"ip":        currentIP,
 		"namespace": namespace,
-	}).Info("RegisterHostname: Starting hostname registration with DHCP server")
+	}).Info("RegisterHostname: Starting hostname registration with DHCP INFORM")
 
 	// Extract just the IP part without CIDR
 	ipOnly := strings.Split(currentIP, "/")[0]
+	clientIP := net.ParseIP(ipOnly)
+	if clientIP == nil {
+		log.WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+			"ip":        currentIP,
+		}).Error("RegisterHostname: Invalid IP address format")
+		return nil
+	}
+
+	// Handle network namespace switching if needed
+	if namespace != "" {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		origNS, err := netns.Get()
+		if err != nil {
+			log.WithError(err).Error("RegisterHostname: Failed to get current namespace")
+			return nil
+		}
+		defer origNS.Close()
+
+		ns, err := netns.GetFromPath(namespace)
+		if err != nil {
+			log.WithError(err).WithField("namespace", namespace).Error("RegisterHostname: Failed to open network namespace")
+			return nil
+		}
+		defer ns.Close()
+
+		if err := netns.Set(ns); err != nil {
+			log.WithError(err).Error("RegisterHostname: Failed to enter network namespace")
+			return nil
+		}
+		defer netns.Set(origNS)
+	}
 
 	log.WithFields(log.Fields{
 		"interface": iface,
 		"hostname":  hostname,
 		"ip_only":   ipOnly,
 		"namespace": namespace,
-	}).Debug("RegisterHostname: Creating DHCP client for hostname registration")
+	}).Debug("RegisterHostname: Creating DHCP client for INFORM message")
 
-	// Use the DHCPClientOptions to handle namespace properly
-	opts := &DHCPClientOptions{
-		Hostname:  hostname,
-		RequestIP: ipOnly,
-		V6:        false,
-		Namespace: namespace,
+	// Create DHCP client
+	client, err := nclient4.New(iface)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+			"namespace": namespace,
+		}).Error("RegisterHostname: Failed to create DHCP client for hostname registration")
+		return nil // Non-fatal
+	}
+	defer client.Close()
+
+	// Get interface hardware address
+	netIface, err := net.InterfaceByName(iface)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+		}).Error("RegisterHostname: Failed to get interface information")
+		return nil
+	}
+
+	// Create DHCP INFORM message with hostname
+	inform, err := dhcpv4.NewInform(netIface.HardwareAddr, clientIP,
+		dhcpv4.WithOption(dhcpv4.OptHostName(hostname)),
+		dhcpv4.WithOption(dhcpv4.OptClassIdentifier("docker-net-dhcp")),
+	)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+		}).Error("RegisterHostname: Failed to create DHCP INFORM message")
+		return nil
 	}
 
 	// Create a timeout context for the hostname registration
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	_, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	log.WithFields(log.Fields{
@@ -654,28 +716,41 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		"hostname":  hostname,
 		"ip":        ipOnly,
 		"namespace": namespace,
-	}).Info("RegisterHostname: Sending DHCP REQUEST with hostname for registration")
+	}).Info("RegisterHostname: Sending DHCP INFORM message for hostname registration")
 
-	// Use GetIP which properly handles namespace switching
-	info, err := GetIP(timeoutCtx, iface, opts)
+	// For DHCP INFORM, we'll use a broadcast UDP socket approach
+	// since nclient4 doesn't have a direct method for sending raw packets
+	conn, err := net.Dial("udp4", "255.255.255.255:67")
 	if err != nil {
-		// Log but don't fail - hostname registration is optional
+		log.WithError(err).WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+		}).Error("RegisterHostname: Failed to create UDP connection for DHCP INFORM")
+		return nil
+	}
+	defer conn.Close()
+
+	// Serialize the DHCP packet to bytes
+	data := inform.ToBytes()
+
+	// Send the packet
+	_, err = conn.Write(data)
+	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
 			"interface": iface,
 			"hostname":  hostname,
 			"ip":        currentIP,
 			"namespace": namespace,
-		}).Error("RegisterHostname: DHCP hostname registration request failed")
+		}).Error("RegisterHostname: Failed to send DHCP INFORM message")
 		return nil
 	}
 
 	log.WithFields(log.Fields{
 		"interface": iface,
 		"hostname":  hostname,
-		"old_ip":    currentIP,
-		"new_ip":    info.IP,
+		"ip":        currentIP,
 		"namespace": namespace,
-	}).Info("RegisterHostname: Hostname successfully registered with DHCP server")
+	}).Info("RegisterHostname: DHCP INFORM message sent successfully for hostname registration")
 
 	return nil
 }
