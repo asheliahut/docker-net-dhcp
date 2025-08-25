@@ -157,43 +157,54 @@ func (c *DHCPClient) runDHCPv4Client(events chan Event) {
 		var lease *nclient4.Lease
 		var err error
 
+		var usingTransferredLease bool
+		
 		// Create a fresh modifiers slice for each request
 		requestModifiers := make([]dhcpv4.Modifier, len(modifiers))
 		copy(requestModifiers, modifiers)
+		
+		// Check if we have an existing lease from transfer
+		if c.lease4 != nil {
+			// Use the existing transferred lease
+			lease = c.lease4
+			usingTransferredLease = true
+			log.Debug("Using existing transferred lease")
+		} else {
 
-		if c.opts.RequestIP != "" {
-			// Request specific IP
-			requestIP := net.ParseIP(c.opts.RequestIP)
-			if requestIP == nil {
-				log.WithField("request_ip", c.opts.RequestIP).Error("Invalid request IP address")
-				continue
+			if c.opts.RequestIP != "" {
+				// Request specific IP
+				requestIP := net.ParseIP(c.opts.RequestIP)
+				if requestIP == nil {
+					log.WithField("request_ip", c.opts.RequestIP).Error("Invalid request IP address")
+					continue
+				}
+
+				requestModifiers = append(requestModifiers, dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(requestIP)))
+				log.WithField("request_ip", c.opts.RequestIP).Debug("Requesting specific IPv4 address")
 			}
 
-			requestModifiers = append(requestModifiers, dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(requestIP)))
-			log.WithField("request_ip", c.opts.RequestIP).Debug("Requesting specific IPv4 address")
+			// Attempt to get a DHCP lease
+			lease, err = client.Request(ctx, requestModifiers...)
+			if err != nil {
+				log.WithError(err).Error("DHCPv4 request failed")
+
+				// Send leasefail event
+				events <- Event{
+					Type: "leasefail",
+					Data: Info{},
+				}
+
+				// Wait before retrying
+				select {
+				case <-time.After(10 * time.Second):
+					continue
+				case <-c.stopChan:
+					return
+				}
+			}
+			
+			c.lease4 = lease
 		}
-
-		// Attempt to get a DHCP lease
-		lease, err = client.Request(ctx, requestModifiers...)
-		if err != nil {
-			log.WithError(err).Error("DHCPv4 request failed")
-
-			// Send leasefail event
-			events <- Event{
-				Type: "leasefail",
-				Data: Info{},
-			}
-
-			// Wait before retrying
-			select {
-			case <-time.After(10 * time.Second):
-				continue
-			case <-c.stopChan:
-				return
-			}
-		}
-
-		c.lease4 = lease
 		ack := lease.ACK
 
 		// Extract IP information
@@ -223,6 +234,14 @@ func (c *DHCPClient) runDHCPv4Client(events chan Event) {
 		events <- Event{
 			Type: "bound",
 			Data: info,
+		}
+
+		// If we used a transferred lease, mark it as consumed after first binding
+		if usingTransferredLease {
+			// We've successfully used the transferred lease, now clear the flag
+			// so future iterations will use normal DHCP renewal/request logic
+			usingTransferredLease = false
+			log.Debug("Transferred lease successfully bound, will use normal renewal cycle")
 		}
 
 		// Calculate renewal time (typically 50% of lease time)
