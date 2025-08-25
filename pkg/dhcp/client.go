@@ -670,7 +670,7 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		"hostname":  hostname,
 		"ip_only":   ipOnly,
 		"namespace": namespace,
-	}).Debug("RegisterHostname: Creating DHCP client for INFORM message")
+	}).Debug("RegisterHostname: Creating DHCP client for hostname registration REQUEST")
 
 	// Create DHCP client
 	client, err := nclient4.New(iface)
@@ -694,21 +694,20 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		return nil
 	}
 
-	// Create DHCP INFORM message with hostname
-	inform, err := dhcpv4.NewInform(netIface.HardwareAddr, clientIP,
+	// Create a DHCP REQUEST message that updates hostname for existing lease
+	// This avoids "address in use" by explicitly requesting the same IP we already have
+	// We'll use client.Request with modifiers to send a proper REQUEST
+	requestModifiers := []dhcpv4.Modifier{
+		dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(clientIP)),
 		dhcpv4.WithOption(dhcpv4.OptHostName(hostname)),
 		dhcpv4.WithOption(dhcpv4.OptClassIdentifier("docker-net-dhcp")),
-	)
-	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"interface": iface,
-			"hostname":  hostname,
-		}).Error("RegisterHostname: Failed to create DHCP INFORM message")
-		return nil
+		dhcpv4.WithOption(dhcpv4.OptClientIdentifier(netIface.HardwareAddr)),
+		// Use a very short lease time to signal this is an update, not a new lease
+		dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(60 * time.Second)),
 	}
 
 	// Create a timeout context for the hostname registration
-	_, cancel := context.WithTimeout(ctx, 10*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	log.WithFields(log.Fields{
@@ -716,32 +715,20 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		"hostname":  hostname,
 		"ip":        ipOnly,
 		"namespace": namespace,
-	}).Info("RegisterHostname: Sending DHCP INFORM message for hostname registration")
+		"client_ip": clientIP.String(),
+	}).Info("RegisterHostname: Sending DHCP REQUEST for hostname registration with existing IP")
 
-	// For DHCP INFORM, we'll use a broadcast UDP socket approach
-	// since nclient4 doesn't have a direct method for sending raw packets
-	conn, err := net.Dial("udp4", "255.255.255.255:67")
+	// Send the REQUEST message using the client's Request method
+	// This properly handles the DHCP protocol flow
+	_, err = client.Request(timeoutCtx, requestModifiers...)
 	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"interface": iface,
-			"hostname":  hostname,
-		}).Error("RegisterHostname: Failed to create UDP connection for DHCP INFORM")
-		return nil
-	}
-	defer conn.Close()
-
-	// Serialize the DHCP packet to bytes
-	data := inform.ToBytes()
-
-	// Send the packet
-	_, err = conn.Write(data)
-	if err != nil {
+		// Log as warning since hostname registration failures are often non-critical
 		log.WithError(err).WithFields(log.Fields{
 			"interface": iface,
 			"hostname":  hostname,
 			"ip":        currentIP,
 			"namespace": namespace,
-		}).Error("RegisterHostname: Failed to send DHCP INFORM message")
+		}).Warn("RegisterHostname: DHCP REQUEST for hostname registration received NAK or timeout (may be normal)")
 		return nil
 	}
 
@@ -750,7 +737,7 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		"hostname":  hostname,
 		"ip":        currentIP,
 		"namespace": namespace,
-	}).Info("RegisterHostname: DHCP INFORM message sent successfully for hostname registration")
+	}).Info("RegisterHostname: DHCP REQUEST for hostname registration completed successfully")
 
 	return nil
 }
