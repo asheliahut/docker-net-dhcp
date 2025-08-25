@@ -130,13 +130,6 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 		return dummy, fmt.Errorf("failed to get info from Docker: %w", err)
 	}
 
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions %+v", n)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Options %+v", n.Options)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Containers %+v", n.Containers)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Labels %+v", n.Labels)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Services %+v", n.Services)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Peers %+v", n.Peers)
-
 	opts, err := decodeOpts(n.Options)
 	if err != nil {
 		return dummy, fmt.Errorf("failed to parse options: %w", err)
@@ -148,9 +141,14 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 // CreateEndpoint creates a veth pair and uses DHCP to acquire an initial IP address on the container end. Docker will
 // move the interface into the container's namespace and apply the address.
 func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (CreateEndpointResponse, error) {
-	log.WithField("options", r.Options).Debug("CreateEndpoint options")
-	log.Debugf("VP>>>>>> CreateEndpoint Request %+v", r)
-	log.Debugf("VP>>>>>> CreateEndpoint Request Interface %+v", r.Interface)
+	log.WithFields(log.Fields{
+		"endpoint_id": r.EndpointID,
+		"network_id":  r.NetworkID,
+		"address":     r.Interface.Address,
+		"address_v6":  r.Interface.AddressIPv6,
+		"mac_address": r.Interface.MacAddress,
+		"options":     r.Options,
+	}).Debug("CreateEndpoint")
 	ctx, cancel := context.WithTimeout(ctx, p.awaitTimeout)
 	defer cancel()
 	res := CreateEndpointResponse{
@@ -185,8 +183,6 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		return res, fmt.Errorf("failed to get bridge interface: %w", err)
 	}
 
-	log.Debugf("VP>>>>>> CreateEndpoint 2")
-
 	hostName, ctrName := vethPairNames(r.EndpointID)
 	la := netlink.NewLinkAttrs()
 	la.Name = hostName
@@ -195,7 +191,6 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		PeerName:  ctrName,
 	}
 
-	log.Debugf("VP>>>>>> CreateEndpoint 3")
 
 	if r.Interface.MacAddress != "" {
 		addr, err := net.ParseMAC(r.Interface.MacAddress)
