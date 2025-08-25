@@ -44,11 +44,12 @@ type dhcpManager struct {
 	cleanupTimer *time.Timer
 }
 
-func newDHCPManager(docker *docker.Client, r JoinRequest, opts DHCPNetworkOptions) *dhcpManager {
+func newDHCPManager(docker *docker.Client, r JoinRequest, opts DHCPNetworkOptions, hostname string) *dhcpManager {
 	return &dhcpManager{
-		docker:  docker,
-		joinReq: r,
-		opts:    opts,
+		docker:   docker,
+		joinReq:  r,
+		opts:     opts,
+		hostname: hostname,
 
 		stopChan: make(chan struct{}),
 	}

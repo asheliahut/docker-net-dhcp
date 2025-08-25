@@ -568,6 +568,14 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 	log.WithField("options", r.Options).Debug("Join options")
 	res := JoinResponse{}
 
+	// Extract hostname from options
+	hostname := ""
+	if r.Options != nil {
+		if hostI, ok := r.Options["hostname"]; ok {
+			hostname, _ = hostI.(string)
+		}
+	}
+
 	opts, err := p.netOptions(ctx, r.NetworkID)
 	if err != nil {
 		return res, fmt.Errorf("failed to get network options: %w", err)
@@ -620,7 +628,7 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		ctx, cancel := context.WithTimeout(context.Background(), p.awaitTimeout)
 		defer cancel()
 
-		m := newDHCPManager(p.docker, r, opts)
+		m := newDHCPManager(p.docker, r, opts, hostname)
 		m.LastIP = hint.IPv4
 		m.LastIPv6 = hint.IPv6
 		m.OriginalMAC = hint.MAC
