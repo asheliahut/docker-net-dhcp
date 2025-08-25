@@ -270,16 +270,64 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			"mac":       finalMAC.String(),
 		}).Debug("[dbg] calling GetIP with interface details")
 
-		// Get IP address using native DHCP client
-		info, err := dhcp.GetIP(timeoutCtx, ctrName, &dhcp.DHCPClientOptions{
+		// Create persistent DHCP client for lease handoff
+		initialClient, err := dhcp.NewDHCPClient(ctrName, &dhcp.DHCPClientOptions{
 			Hostname: hostname,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to get DHCP IP: %w", err)
+			return fmt.Errorf("failed to create initial DHCP client: %w", err)
 		}
+
+		// Start the client
+		events, err := initialClient.Start()
+		if err != nil {
+			return fmt.Errorf("failed to start initial DHCP client: %w", err)
+		}
+
+		// Wait for initial lease
+		var info dhcp.Info
+		select {
+		case event := <-events:
+			if event.Type == "bound" {
+				info = event.Data
+				log.WithFields(log.Fields{
+					"interface": ctrName,
+					"ip":        info.IP,
+					"gateway":   info.Gateway,
+				}).Debug("Initial DHCP client acquired lease")
+			} else if event.Type == "leasefail" {
+				initialClient.Finish(timeoutCtx)
+				return fmt.Errorf("failed to get DHCP lease")
+			} else {
+				// Wait for bound event
+				for {
+					select {
+					case nextEvent := <-events:
+						if nextEvent.Type == "bound" {
+							info = nextEvent.Data
+							goto leaseAcquired
+						} else if nextEvent.Type == "leasefail" {
+							initialClient.Finish(timeoutCtx)
+							return fmt.Errorf("failed to get DHCP lease")
+						}
+					case <-timeoutCtx.Done():
+						initialClient.Finish(timeoutCtx)
+						return fmt.Errorf("timeout waiting for DHCP lease")
+					}
+				}
+			}
+		case <-timeoutCtx.Done():
+			initialClient.Finish(timeoutCtx)
+			return fmt.Errorf("timeout waiting for DHCP lease")
+		}
+
+	leaseAcquired:
+		// Store the client for lease handoff
+		p.initialDHCP[r.EndpointID] = initialClient
 
 		ipv4, err := netlink.ParseAddr(info.IP)
 		if err != nil {
+			initialClient.Finish(timeoutCtx)
 			return fmt.Errorf("failed to parse initial IPv4 address: %w", err)
 		}
 
@@ -335,8 +383,17 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 
 		return nil
 	}(); err != nil {
-		// Be sure to clean up the veth pair if any of this fails
+		// Be sure to clean up the veth pair and initial client if any of this fails
 		netlink.LinkDel(hostLink)
+		
+		// Clean up initial client if it was created
+		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			initialClient.Finish(ctx)
+			cancel()
+			delete(p.initialDHCP, r.EndpointID)
+		}
+		
 		return res, err
 	}
 
@@ -397,6 +454,22 @@ func (p *Plugin) DeleteEndpoint(r DeleteEndpointRequest) error {
 	if err := netlink.LinkDel(link); err != nil {
 		return fmt.Errorf("failed to delete veth pair: %w", err)
 	}
+
+	// Clean up any remaining initial DHCP client
+	if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := initialClient.Finish(ctx); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"network":  r.NetworkID[:12],
+				"endpoint": r.EndpointID[:12],
+			}).Warn("Failed to cleanly finish initial DHCP client during endpoint deletion")
+		}
+		cancel()
+		delete(p.initialDHCP, r.EndpointID)
+	}
+
+	// Clean up join hints
+	delete(p.joinHints, r.EndpointID)
 
 	log.WithFields(log.Fields{
 		"network":  r.NetworkID[:12],
@@ -552,8 +625,22 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		m.LastIPv6 = hint.IPv6
 		m.OriginalMAC = hint.MAC
 
-		// Transfer the initial client to the manager for cleanup
-		// No initial client to clean up since we use one-shot DHCP in CreateEndpoint
+		// Transfer the initial client to the manager for lease handoff
+		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
+			m.leaseClient = initialClient
+			delete(p.initialDHCP, r.EndpointID)
+			log.WithFields(log.Fields{
+				"network":  r.NetworkID[:12],
+				"endpoint": r.EndpointID[:12],
+				"sandbox":  r.SandboxKey,
+			}).Debug("Transferred initial DHCP client to manager for lease handoff")
+		} else {
+			log.WithFields(log.Fields{
+				"network":  r.NetworkID[:12],
+				"endpoint": r.EndpointID[:12],
+				"sandbox":  r.SandboxKey,
+			}).Warn("No initial DHCP client found for lease handoff")
+		}
 
 		if err := m.Start(ctx); err != nil {
 			log.WithError(err).WithFields(log.Fields{

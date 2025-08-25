@@ -190,6 +190,9 @@ func (p *Plugin) Close() error {
 	// Clean up any remaining DHCP managers with timeout
 	p.cleanupAllManagers(30 * time.Second)
 
+	// Clean up any remaining initial DHCP clients
+	p.cleanupAllInitialClients(10 * time.Second)
+
 	if err := p.docker.Close(); err != nil {
 		return fmt.Errorf("failed to close docker client: %w", err)
 	}
@@ -319,11 +322,20 @@ func (p *Plugin) performPeriodicCleanup() {
 	log.Debug("Performing periodic resource cleanup check")
 
 	staleManagers := make([]string, 0)
-
+	staleInitialClients := make([]string, 0)
+	
 	// Check each DHCP manager for staleness
 	for endpointID, manager := range p.persistentDHCP {
 		if p.isManagerStale(manager) {
 			staleManagers = append(staleManagers, endpointID)
+		}
+	}
+
+	// Check for stale initial clients (shouldn't happen, but safety net)
+	for endpointID := range p.initialDHCP {
+		// If there's an initial client without a corresponding manager, it's likely stale
+		if _, hasManager := p.persistentDHCP[endpointID]; !hasManager {
+			staleInitialClients = append(staleInitialClients, endpointID)
 		}
 	}
 
@@ -341,8 +353,29 @@ func (p *Plugin) performPeriodicCleanup() {
 		delete(p.persistentDHCP, endpointID)
 	}
 
-	if len(staleManagers) > 0 {
-		log.WithField("count", len(staleManagers)).Info("Cleaned up stale DHCP managers")
+	// Clean up stale initial clients
+	for _, endpointID := range staleInitialClients {
+		client := p.initialDHCP[endpointID]
+		log.WithField("endpoint", endpointID[:12]).Warn("Cleaning up stale initial DHCP client")
+
+		go func(c *dhcp.DHCPClient, id string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := c.Finish(ctx); err != nil {
+				log.WithError(err).WithField("endpoint", id[:12]).Error("Failed to stop stale initial DHCP client")
+			}
+		}(client, endpointID)
+
+		delete(p.initialDHCP, endpointID)
+	}
+
+	totalCleaned := len(staleManagers) + len(staleInitialClients)
+	if totalCleaned > 0 {
+		log.WithFields(log.Fields{
+			"managers": len(staleManagers),
+			"initial_clients": len(staleInitialClients),
+			"total": totalCleaned,
+		}).Info("Cleaned up stale DHCP resources")
 	}
 }
 
@@ -419,4 +452,53 @@ func (p *Plugin) cleanupAllManagers(timeout time.Duration) {
 	}
 
 	log.Info("All DHCP managers cleaned up")
+}
+
+// cleanupAllInitialClients cleans up all initial DHCP clients with timeout
+func (p *Plugin) cleanupAllInitialClients(timeout time.Duration) {
+	if len(p.initialDHCP) == 0 {
+		return
+	}
+
+	log.WithField("count", len(p.initialDHCP)).Info("Cleaning up all initial DHCP clients")
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Create a channel to track completion
+	done := make(chan struct{}, len(p.initialDHCP))
+
+	// Start cleanup for each initial client
+	for endpointID, client := range p.initialDHCP {
+		go func(c *dhcp.DHCPClient, id string) {
+			defer func() { done <- struct{}{} }()
+
+			if err := c.Finish(ctx); err != nil {
+				log.WithError(err).WithField("endpoint", id[:12]).Error("Failed to stop initial DHCP client during shutdown")
+			}
+		}(client, endpointID)
+	}
+
+	// Wait for all clients to finish or timeout
+	clientsToWait := len(p.initialDHCP)
+	for i := 0; i < clientsToWait; i++ {
+		select {
+		case <-done:
+			// Client finished
+		case <-ctx.Done():
+			log.Warn("Timeout waiting for initial DHCP clients to stop")
+			// Clear the map even if some didn't finish cleanly
+			for endpointID := range p.initialDHCP {
+				delete(p.initialDHCP, endpointID)
+			}
+			return
+		}
+	}
+
+	// Clear the map
+	for endpointID := range p.initialDHCP {
+		delete(p.initialDHCP, endpointID)
+	}
+
+	log.Info("All initial DHCP clients cleaned up")
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
@@ -42,6 +43,10 @@ type DHCPClient struct {
 	lease4    *nclient4.Lease
 	lease6    *dhcpv6.Message
 	stopChan  chan struct{}
+	
+	// Lease handoff support
+	isTransferred bool
+	transferMutex sync.RWMutex
 }
 
 // Event represents a DHCP event
@@ -509,23 +514,32 @@ func (c *DHCPClient) runDHCPv6Client(events chan Event) {
 
 // Finish gracefully stops the DHCP client
 func (c *DHCPClient) Finish(ctx context.Context) error {
+	c.transferMutex.RLock()
+	isTransferred := c.isTransferred
+	c.transferMutex.RUnlock()
+
 	close(c.stopChan)
 
 	var err error
 
-	// Release IPv4 lease if present
-	if c.client4 != nil && c.lease4 != nil {
-		if releaseErr := c.client4.Release(c.lease4); releaseErr != nil {
-			log.WithError(releaseErr).Warn("Failed to release DHCPv4 lease")
-			err = releaseErr
-		} else {
-			log.Debug("DHCPv4 lease released successfully")
+	// Only release lease if it hasn't been transferred
+	if !isTransferred {
+		// Release IPv4 lease if present
+		if c.client4 != nil && c.lease4 != nil {
+			if releaseErr := c.client4.Release(c.lease4); releaseErr != nil {
+				log.WithError(releaseErr).Warn("Failed to release DHCPv4 lease")
+				err = releaseErr
+			} else {
+				log.Debug("DHCPv4 lease released successfully")
+			}
 		}
-	}
 
-	// DHCPv6 client doesn't support release method
-	if c.client6 != nil && c.lease6 != nil {
-		log.Debug("DHCPv6 lease will expire naturally (no release method available)")
+		// DHCPv6 client doesn't support release method
+		if c.client6 != nil && c.lease6 != nil {
+			log.Debug("DHCPv6 lease will expire naturally (no release method available)")
+		}
+	} else {
+		log.Debug("Skipping lease release - lease was transferred to persistent client")
 	}
 
 	// Close clients
@@ -576,4 +590,122 @@ func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, er
 func prefixLenFromMask(mask net.IPMask) int {
 	ones, _ := mask.Size()
 	return ones
+}
+
+// LeaseInfo contains information about an active DHCP lease
+type LeaseInfo struct {
+	IPv4Lease    *nclient4.Lease
+	IPv6Lease    *dhcpv6.Message
+	AcquiredTime time.Time
+	IsIPv6       bool
+}
+
+// GetActiveLease returns the current active lease information
+func (c *DHCPClient) GetActiveLease() (*LeaseInfo, error) {
+	c.transferMutex.RLock()
+	defer c.transferMutex.RUnlock()
+
+	if c.isTransferred {
+		return nil, fmt.Errorf("lease has already been transferred")
+	}
+
+	info := &LeaseInfo{
+		AcquiredTime: time.Now(),
+	}
+
+	if c.lease4 != nil {
+		info.IPv4Lease = c.lease4
+		info.IsIPv6 = false
+	} else if c.lease6 != nil {
+		info.IPv6Lease = c.lease6
+		info.IsIPv6 = true
+	} else {
+		return nil, fmt.Errorf("no active lease available")
+	}
+
+	return info, nil
+}
+
+// TransferLease marks this client as transferred and returns lease info for handoff
+func (c *DHCPClient) TransferLease() (*LeaseInfo, error) {
+	c.transferMutex.Lock()
+	defer c.transferMutex.Unlock()
+
+	if c.isTransferred {
+		return nil, fmt.Errorf("lease has already been transferred")
+	}
+
+	leaseInfo, err := c.getActiveLeaseUnsafe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active lease: %w", err)
+	}
+
+	// Mark as transferred to prevent accidental release
+	c.isTransferred = true
+
+	log.WithFields(log.Fields{
+		"interface": c.ifaceName,
+		"ipv6":      leaseInfo.IsIPv6,
+		"ip":        c.getLeaseIP(leaseInfo),
+	}).Info("DHCP lease transferred to persistent client")
+
+	return leaseInfo, nil
+}
+
+// getActiveLeaseUnsafe returns lease info without locking (internal use)
+func (c *DHCPClient) getActiveLeaseUnsafe() (*LeaseInfo, error) {
+	info := &LeaseInfo{
+		AcquiredTime: time.Now(),
+	}
+
+	if c.lease4 != nil {
+		info.IPv4Lease = c.lease4
+		info.IsIPv6 = false
+	} else if c.lease6 != nil {
+		info.IPv6Lease = c.lease6
+		info.IsIPv6 = true
+	} else {
+		return nil, fmt.Errorf("no active lease available")
+	}
+
+	return info, nil
+}
+
+// getLeaseIP extracts IP address from lease info
+func (c *DHCPClient) getLeaseIP(leaseInfo *LeaseInfo) string {
+	if leaseInfo.IsIPv6 && leaseInfo.IPv6Lease != nil {
+		// Extract IPv6 address
+		if iana := leaseInfo.IPv6Lease.Options.OneIANA(); iana != nil {
+			if addrs := iana.Options.Addresses(); len(addrs) > 0 {
+				return fmt.Sprintf("%s/64", addrs[0].IPv6Addr.String())
+			}
+		}
+	} else if leaseInfo.IPv4Lease != nil {
+		ack := leaseInfo.IPv4Lease.ACK
+		return fmt.Sprintf("%s/%d", ack.YourIPAddr.String(), prefixLenFromMask(ack.SubnetMask()))
+	}
+	return "unknown"
+}
+
+// NewDHCPClientFromLease creates a new DHCP client with an existing lease
+func NewDHCPClientFromLease(iface string, opts *DHCPClientOptions, leaseInfo *LeaseInfo) (*DHCPClient, error) {
+	client, err := NewDHCPClient(iface, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pre-populate with existing lease
+	if leaseInfo.IsIPv6 {
+		client.lease6 = leaseInfo.IPv6Lease
+	} else {
+		client.lease4 = leaseInfo.IPv4Lease
+	}
+
+	log.WithFields(log.Fields{
+		"interface": iface,
+		"ipv6":      leaseInfo.IsIPv6,
+		"ip":        client.getLeaseIP(leaseInfo),
+	}).Info("Created DHCP client from transferred lease")
+
+	return client, nil
 }

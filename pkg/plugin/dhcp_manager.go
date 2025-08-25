@@ -37,6 +37,7 @@ type dhcpManager struct {
 	netHandle *netlink.Handle
 	ctrLink   netlink.Link
 
+	leaseClient  *dhcp.DHCPClient // For lease handoff
 	stopChan     chan struct{}
 	errChan      chan error
 	errChanV6    chan error
@@ -163,6 +164,75 @@ func (m *dhcpManager) renew(v6 bool, info dhcp.Info) error {
 	}
 
 	return nil
+}
+
+// setupClientFromLease creates a DHCP client from an existing lease
+func (m *dhcpManager) setupClientFromLease(leaseInfo *dhcp.LeaseInfo) (chan error, error) {
+	v6 := leaseInfo.IsIPv6
+	v6Str := ""
+	if v6 {
+		v6Str = "v6"
+	}
+
+	log.WithFields(m.logFields(v6)).Info("Starting persistent DHCP client from transferred lease")
+
+	options := &dhcp.DHCPClientOptions{
+		Hostname:  m.hostname,
+		V6:        v6,
+		Namespace: m.nsPath,
+	}
+
+	// Create client from existing lease
+	client, err := dhcp.NewDHCPClientFromLease(m.ctrLink.Attrs().Name, options, leaseInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DHCP%s client from lease: %w", v6Str, err)
+	}
+
+	events, err := client.Start()
+	if err != nil {
+		return nil, fmt.Errorf("failed to start transferred DHCP%s client: %w", v6Str, err)
+	}
+
+	errChan := make(chan error)
+	go func() {
+		defer close(errChan)
+		
+		for {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					// Events channel closed, DHCP client stopped
+					return
+				}
+				
+				switch event.Type {
+				case "bound":
+					log.WithFields(m.logFields(v6)).WithField("ip", event.Data.IP).WithField("gateway", event.Data.Gateway).Info("Transferred DHCP client confirmed lease binding")
+					// No need to handle bound since we already have the IP configured
+				case "renew":
+					log.WithFields(m.logFields(v6)).Debug("Transferred DHCP client lease renewal")
+
+					if err := m.renew(v6, event.Data); err != nil {
+						log.WithError(err).WithFields(m.logFields(v6)).WithField("gateway", event.Data.Gateway).WithField("new_ip", event.Data.IP).Error("Failed to execute IP renewal")
+					}
+				case "leasefail":
+					log.WithFields(m.logFields(v6)).Warn("Transferred DHCP client failed to maintain lease")
+				}
+
+			case <-m.stopChan:
+				log.WithFields(m.logFields(v6)).Info("Shutting down transferred DHCP client")
+
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				err := client.Finish(ctx)
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	return errChan, nil
 }
 
 func (m *dhcpManager) setupClient(v6 bool) (chan error, error) {
@@ -417,11 +487,38 @@ func (m *dhcpManager) Start(ctx context.Context) error {
 			}).Warn("OriginalMAC is nil, cannot restore MAC address")
 		}
 
-		// No initial client to clean up since CreateEndpoint uses one-shot DHCP
+		// Check if we have a transferred lease to use
+		if m.leaseClient != nil {
+			// Transfer the lease from initial client
+			leaseInfo, err := m.leaseClient.TransferLease()
+			if err != nil {
+				log.WithFields(m.logFields(false)).WithError(err).Warn("Failed to transfer lease, falling back to new DHCP request")
+				// Fallback to normal setup
+				if m.errChan, err = m.setupClient(false); err != nil {
+					close(m.stopChan)
+					return err
+				}
+			} else {
+				// Use transferred lease
+				if m.errChan, err = m.setupClientFromLease(leaseInfo); err != nil {
+					close(m.stopChan)
+					return err
+				}
+			}
 
-		if m.errChan, err = m.setupClient(false); err != nil {
-			close(m.stopChan)
-			return err
+			// Clean up the initial client
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if finishErr := m.leaseClient.Finish(ctx); finishErr != nil {
+				log.WithFields(m.logFields(false)).WithError(finishErr).Warn("Failed to cleanly finish initial DHCP client")
+			}
+			cancel()
+			m.leaseClient = nil
+		} else {
+			// No transferred lease, use normal setup
+			if m.errChan, err = m.setupClient(false); err != nil {
+				close(m.stopChan)
+				return err
+			}
 		}
 
 		if m.opts.IPv6 {
