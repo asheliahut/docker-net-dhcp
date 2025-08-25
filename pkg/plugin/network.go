@@ -288,25 +288,27 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		var info dhcp.Info
 		select {
 		case event := <-events:
-			if event.Type == "bound" {
+			switch event.Type {
+			case "bound":
 				info = event.Data
 				log.WithFields(log.Fields{
 					"interface": ctrName,
 					"ip":        info.IP,
 					"gateway":   info.Gateway,
 				}).Debug("Initial DHCP client acquired lease")
-			} else if event.Type == "leasefail" {
+			case "leasefail":
 				initialClient.Finish(timeoutCtx)
 				return fmt.Errorf("failed to get DHCP lease")
-			} else {
+			default:
 				// Wait for bound event
 				for {
 					select {
 					case nextEvent := <-events:
-						if nextEvent.Type == "bound" {
+						switch nextEvent.Type {
+						case "bound":
 							info = nextEvent.Data
 							goto leaseAcquired
-						} else if nextEvent.Type == "leasefail" {
+						case "leasefail":
 							initialClient.Finish(timeoutCtx)
 							return fmt.Errorf("failed to get DHCP lease")
 						}
