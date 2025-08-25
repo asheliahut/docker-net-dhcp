@@ -607,7 +607,7 @@ func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, er
 }
 
 // RegisterHostname performs a DHCP request to register hostname with the DHCP server
-// This requests the same IP that is already assigned but includes the hostname option
+// This forces a new DHCP REQUEST message to be sent with the hostname option
 func RegisterHostname(ctx context.Context, iface string, currentIP string, hostname string) error {
 	if hostname == "" {
 		return nil // Nothing to register
@@ -617,39 +617,76 @@ func RegisterHostname(ctx context.Context, iface string, currentIP string, hostn
 		"interface": iface,
 		"hostname":  hostname,
 		"ip":        currentIP,
-	}).Info("Registering hostname with DHCP server")
+	}).Info("Registering hostname with DHCP server via new DHCP request")
 
 	// Extract just the IP part without CIDR
 	ipOnly := strings.Split(currentIP, "/")[0]
 
-	// Use the existing GetIP function but with hostname and requesting the same IP
-	opts := &DHCPClientOptions{
-		Hostname:  hostname,
-		RequestIP: ipOnly,
-		V6:        false,
+	// Create DHCP client
+	client, err := nclient4.New(iface)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+		}).Warn("Failed to create DHCP client for hostname registration")
+		return nil // Non-fatal
+	}
+	defer client.Close()
+
+	// Configure DHCP options with hostname
+	modifiers := []dhcpv4.Modifier{
+		dhcpv4.WithOption(dhcpv4.OptHostName(hostname)),
+		dhcpv4.WithOption(dhcpv4.OptClassIdentifier("docker-net-dhcp")),
 	}
 
-	// Create a short timeout context for the hostname registration
+	// Request the same IP we currently have
+	requestIP := net.ParseIP(ipOnly)
+	if requestIP != nil {
+		modifiers = append(modifiers, dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(requestIP)))
+		log.WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+			"request_ip": ipOnly,
+		}).Debug("Requesting same IP with hostname registration")
+	}
+
+	// Create a timeout context for the hostname registration
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	info, err := GetIP(timeoutCtx, iface, opts)
+	// Force a new DHCP REQUEST to ensure hostname is sent
+	log.WithFields(log.Fields{
+		"interface": iface,
+		"hostname":  hostname,
+		"ip":        ipOnly,
+	}).Info("Sending DHCP REQUEST with hostname for registration")
+
+	lease, err := client.Request(timeoutCtx, modifiers...)
 	if err != nil {
 		// Log but don't fail - hostname registration is optional
 		log.WithError(err).WithFields(log.Fields{
 			"interface": iface,
 			"hostname":  hostname,
 			"ip":        currentIP,
-		}).Warn("DHCP hostname registration failed")
+		}).Warn("DHCP hostname registration request failed")
 		return nil
 	}
 
-	log.WithFields(log.Fields{
-		"interface": iface,
-		"hostname":  hostname,
-		"old_ip":    currentIP,
-		"new_ip":    info.IP,
-	}).Info("Hostname successfully registered with DHCP server")
+	if lease != nil && lease.ACK != nil {
+		newIP := fmt.Sprintf("%s/%d", lease.ACK.YourIPAddr.String(), prefixLenFromMask(lease.ACK.SubnetMask()))
+		log.WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+			"old_ip":    currentIP,
+			"new_ip":    newIP,
+		}).Info("Hostname successfully registered with DHCP server via REQUEST")
+	} else {
+		log.WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+			"ip":        currentIP,
+		}).Warn("DHCP hostname registration: no ACK received")
+	}
 
 	return nil
 }
