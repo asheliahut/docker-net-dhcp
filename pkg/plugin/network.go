@@ -385,7 +385,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	}(); err != nil {
 		// Be sure to clean up the veth pair and initial client if any of this fails
 		netlink.LinkDel(hostLink)
-		
+
 		// Clean up initial client if it was created
 		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -393,7 +393,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			cancel()
 			delete(p.initialDHCP, r.EndpointID)
 		}
-		
+
 		return res, err
 	}
 
@@ -632,6 +632,30 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		m.LastIP = hint.IPv4
 		m.LastIPv6 = hint.IPv6
 		m.OriginalMAC = hint.MAC
+
+		// Register hostname with DHCP server if we have a hostname and an IPv4 address
+		if hostname != "" && hint.IPv4 != nil {
+			_, ctrName := vethPairNames(r.EndpointID)
+			currentIP := hint.IPv4.String()
+
+			log.WithFields(log.Fields{
+				"network":  r.NetworkID[:12],
+				"endpoint": r.EndpointID[:12],
+				"sandbox":  r.SandboxKey,
+				"hostname": hostname,
+				"ip":       currentIP,
+			}).Info("[Join] Registering hostname with DHCP server")
+
+			if err := dhcp.RegisterHostname(ctx, ctrName, currentIP, hostname); err != nil {
+				log.WithError(err).WithFields(log.Fields{
+					"network":  r.NetworkID[:12],
+					"endpoint": r.EndpointID[:12],
+					"sandbox":  r.SandboxKey,
+					"hostname": hostname,
+					"ip":       currentIP,
+				}).Warn("[Join] Failed to register hostname with DHCP server")
+			}
+		}
 
 		// Transfer the initial client to the manager for lease handoff
 		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,7 +44,7 @@ type DHCPClient struct {
 	lease4    *nclient4.Lease
 	lease6    *dhcpv6.Message
 	stopChan  chan struct{}
-	
+
 	// Lease handoff support
 	isTransferred bool
 	transferMutex sync.RWMutex
@@ -158,11 +159,11 @@ func (c *DHCPClient) runDHCPv4Client(events chan Event) {
 		var err error
 
 		var usingTransferredLease bool
-		
+
 		// Create a fresh modifiers slice for each request
 		requestModifiers := make([]dhcpv4.Modifier, len(modifiers))
 		copy(requestModifiers, modifiers)
-		
+
 		// Check if we have an existing lease from transfer
 		if c.lease4 != nil {
 			// Use the existing transferred lease
@@ -202,7 +203,7 @@ func (c *DHCPClient) runDHCPv4Client(events chan Event) {
 					return
 				}
 			}
-			
+
 			c.lease4 = lease
 		}
 		ack := lease.ACK
@@ -603,6 +604,54 @@ func GetIP(ctx context.Context, iface string, opts *DHCPClientOptions) (Info, er
 
 	client.Finish(ctx)
 	return Info{}, util.ErrNoLease
+}
+
+// RegisterHostname performs a DHCP request to register hostname with the DHCP server
+// This requests the same IP that is already assigned but includes the hostname option
+func RegisterHostname(ctx context.Context, iface string, currentIP string, hostname string) error {
+	if hostname == "" {
+		return nil // Nothing to register
+	}
+
+	log.WithFields(log.Fields{
+		"interface": iface,
+		"hostname":  hostname,
+		"ip":        currentIP,
+	}).Info("Registering hostname with DHCP server")
+
+	// Extract just the IP part without CIDR
+	ipOnly := strings.Split(currentIP, "/")[0]
+
+	// Use the existing GetIP function but with hostname and requesting the same IP
+	opts := &DHCPClientOptions{
+		Hostname:  hostname,
+		RequestIP: ipOnly,
+		V6:        false,
+	}
+
+	// Create a short timeout context for the hostname registration
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	info, err := GetIP(timeoutCtx, iface, opts)
+	if err != nil {
+		// Log but don't fail - hostname registration is optional
+		log.WithError(err).WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+			"ip":        currentIP,
+		}).Warn("DHCP hostname registration failed")
+		return nil
+	}
+
+	log.WithFields(log.Fields{
+		"interface": iface,
+		"hostname":  hostname,
+		"old_ip":    currentIP,
+		"new_ip":    info.IP,
+	}).Info("Hostname successfully registered with DHCP server")
+
+	return nil
 }
 
 // Helper function to convert subnet mask to prefix length
