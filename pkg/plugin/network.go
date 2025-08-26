@@ -186,11 +186,10 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 	hostName, ctrName := vethPairNames(r.EndpointID)
 	la := netlink.NewLinkAttrs()
 	la.Name = hostName
-	hostLink := &netlink.Veth{
+	newVeth := &netlink.Veth{
 		LinkAttrs: la,
 		PeerName:  ctrName,
 	}
-
 
 	if r.Interface.MacAddress != "" {
 		addr, err := net.ParseMAC(r.Interface.MacAddress)
@@ -198,26 +197,46 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			return res, util.ErrMACAddress
 		}
 
-		hostLink.PeerHardwareAddr = addr
+		newVeth.PeerHardwareAddr = addr
 	}
 
-	if err := netlink.LinkAdd(hostLink); err != nil {
+	// Create the veth pair
+	if err := netlink.LinkAdd(newVeth); err != nil {
 		return res, fmt.Errorf("failed to create veth pair: %w", err)
 	}
 	if err := func() error {
-		if err := netlink.LinkSetUp(hostLink); err != nil {
-			return fmt.Errorf("failed to set host side link of veth pair up: %w", err)
+		// Get the host and container links from the veth pair
+		hostLink, err := netlink.LinkByName(hostName)
+		if err != nil {
+			return fmt.Errorf("failed to find host side of veth pair: %w", err)
 		}
 
 		ctrLink, err := netlink.LinkByName(ctrName)
 		if err != nil {
 			return fmt.Errorf("failed to find container side of veth pair: %w", err)
 		}
+
+		// Forward the host side of the pair to the bridge interface
+		if err := netlink.LinkSetMaster(hostLink, bridge); err != nil {
+			return fmt.Errorf("failed to attach host side link of veth peer to bridge: %w", err)
+		}
+
+		// Bring up the host side and container side of the veth pair
+		if err := netlink.LinkSetUp(hostLink); err != nil {
+			return fmt.Errorf("failed to set host side link of veth pair up: %w", err)
+		}
 		if err := netlink.LinkSetUp(ctrLink); err != nil {
 			return fmt.Errorf("failed to set container side link of veth pair up: %w", err)
 		}
 
-		// Store the desired MAC address before any operations that might change it
+		// Refresh the container link. The MAC address may have changed during the above operations
+		ctrLink, err = netlink.LinkByIndex(ctrLink.Attrs().Index)
+		if err != nil {
+			return fmt.Errorf("failed to refresh container side of veth pair: %w", err)
+		}
+
+		// Decide what we want the final MAC address to be-- either the requested MAC address
+		// or the random address from the kernel
 		var finalMAC net.HardwareAddr
 		if r.Interface.MacAddress != "" {
 			var err error
@@ -225,22 +244,18 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			if err != nil {
 				return fmt.Errorf("failed to parse provided MAC address: %w", err)
 			}
+			log.Debugf("Using requested MAC address: %v", finalMAC)
 		} else {
 			// Use the kernel-assigned random MAC address
 			finalMAC = ctrLink.Attrs().HardwareAddr
 			res.Interface.MacAddress = finalMAC.String()
+			log.Debugf("Using auto-assigned MAC address: %v", finalMAC)
 		}
 
-		if err := netlink.LinkSetMaster(hostLink, bridge); err != nil {
-			return fmt.Errorf("failed to attach host side link of veth peer to bridge: %w", err)
-		}
-
-		// Set MAC address after LinkSetMaster since the kernel often resets it during bridge attachment
+		// Assign the final MAC address to the container link
 		if err := netlink.LinkSetHardwareAddr(ctrLink, finalMAC); err != nil {
 			return fmt.Errorf("failed to set container side of veth pair's MAC address: %w", err)
 		}
-
-		log.Debug("VP>>>>>> CreateEndpoint 4 - MAC address set, preparing DHCP")
 
 		timeout := defaultLeaseTimeout
 		if opts.LeaseTimeout != 0 {
@@ -257,13 +272,6 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		// Get IPv4 address via DHCP using consistent MAC address
 		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-
-		log.WithFields(log.Fields{
-			"interface": ctrName,
-			"hostname":  hostname,
-			"timeout":   timeout,
-			"mac":       finalMAC.String(),
-		}).Debug("[dbg] calling GetIP with interface details")
 
 		// Create persistent DHCP client for lease handoff
 		initialClient, err := dhcp.NewDHCPClient(ctrName, &dhcp.DHCPClientOptions{
@@ -381,7 +389,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		return nil
 	}(); err != nil {
 		// Be sure to clean up the veth pair and initial client if any of this fails
-		netlink.LinkDel(hostLink)
+		netlink.LinkDel(newVeth)
 
 		// Clean up initial client if it was created
 		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
