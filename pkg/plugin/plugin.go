@@ -237,7 +237,7 @@ func (p *Plugin) monitorContainerEvents() {
 
 // handleContainerEvent processes container lifecycle events
 func (p *Plugin) handleContainerEvent(event events.Message) {
-	containerID := event.ID
+	containerID := event.Actor.ID
 	action := event.Action
 
 	log.WithFields(log.Fields{
@@ -322,7 +322,7 @@ func (p *Plugin) performPeriodicCleanup() {
 
 	staleManagers := make([]string, 0)
 	staleInitialClients := make([]string, 0)
-	
+
 	// Check each DHCP manager for staleness
 	for endpointID, manager := range p.persistentDHCP {
 		if p.isManagerStale(manager) {
@@ -371,9 +371,9 @@ func (p *Plugin) performPeriodicCleanup() {
 	totalCleaned := len(staleManagers) + len(staleInitialClients)
 	if totalCleaned > 0 {
 		log.WithFields(log.Fields{
-			"managers": len(staleManagers),
+			"managers":        len(staleManagers),
 			"initial_clients": len(staleInitialClients),
-			"total": totalCleaned,
+			"total":           totalCleaned,
 		}).Info("Cleaned up stale DHCP resources")
 	}
 }

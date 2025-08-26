@@ -130,13 +130,6 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 		return dummy, fmt.Errorf("failed to get info from Docker: %w", err)
 	}
 
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions %+v", n)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Options %+v", n.Options)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Containers %+v", n.Containers)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Labels %+v", n.Labels)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Services %+v", n.Services)
-	log.Debugf("VP>>>>>> CreateEndpoint netOptions Peers %+v", n.Peers)
-
 	opts, err := decodeOpts(n.Options)
 	if err != nil {
 		return dummy, fmt.Errorf("failed to parse options: %w", err)
@@ -148,9 +141,14 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 // CreateEndpoint creates a veth pair and uses DHCP to acquire an initial IP address on the container end. Docker will
 // move the interface into the container's namespace and apply the address.
 func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (CreateEndpointResponse, error) {
-	log.WithField("options", r.Options).Debug("CreateEndpoint options")
-	log.Debugf("VP>>>>>> CreateEndpoint Request %+v", r)
-	log.Debugf("VP>>>>>> CreateEndpoint Request Interface %+v", r.Interface)
+	log.WithFields(log.Fields{
+		"endpoint_id": r.EndpointID,
+		"network_id":  r.NetworkID,
+		"address":     r.Interface.Address,
+		"address_v6":  r.Interface.AddressIPv6,
+		"mac_address": r.Interface.MacAddress,
+		"options":     r.Options,
+	}).Debug("CreateEndpoint")
 	ctx, cancel := context.WithTimeout(ctx, p.awaitTimeout)
 	defer cancel()
 	res := CreateEndpointResponse{
@@ -185,17 +183,13 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		return res, fmt.Errorf("failed to get bridge interface: %w", err)
 	}
 
-	log.Debugf("VP>>>>>> CreateEndpoint 2")
-
 	hostName, ctrName := vethPairNames(r.EndpointID)
 	la := netlink.NewLinkAttrs()
 	la.Name = hostName
-	hostLink := &netlink.Veth{
+	newVeth := &netlink.Veth{
 		LinkAttrs: la,
 		PeerName:  ctrName,
 	}
-
-	log.Debugf("VP>>>>>> CreateEndpoint 3")
 
 	if r.Interface.MacAddress != "" {
 		addr, err := net.ParseMAC(r.Interface.MacAddress)
@@ -203,26 +197,46 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			return res, util.ErrMACAddress
 		}
 
-		hostLink.PeerHardwareAddr = addr
+		newVeth.PeerHardwareAddr = addr
 	}
 
-	if err := netlink.LinkAdd(hostLink); err != nil {
+	// Create the veth pair
+	if err := netlink.LinkAdd(newVeth); err != nil {
 		return res, fmt.Errorf("failed to create veth pair: %w", err)
 	}
 	if err := func() error {
-		if err := netlink.LinkSetUp(hostLink); err != nil {
-			return fmt.Errorf("failed to set host side link of veth pair up: %w", err)
+		// Get the host and container links from the veth pair
+		hostLink, err := netlink.LinkByName(hostName)
+		if err != nil {
+			return fmt.Errorf("failed to find host side of veth pair: %w", err)
 		}
 
 		ctrLink, err := netlink.LinkByName(ctrName)
 		if err != nil {
 			return fmt.Errorf("failed to find container side of veth pair: %w", err)
 		}
+
+		// Forward the host side of the pair to the bridge interface
+		if err := netlink.LinkSetMaster(hostLink, bridge); err != nil {
+			return fmt.Errorf("failed to attach host side link of veth peer to bridge: %w", err)
+		}
+
+		// Bring up the host side and container side of the veth pair
+		if err := netlink.LinkSetUp(hostLink); err != nil {
+			return fmt.Errorf("failed to set host side link of veth pair up: %w", err)
+		}
 		if err := netlink.LinkSetUp(ctrLink); err != nil {
 			return fmt.Errorf("failed to set container side link of veth pair up: %w", err)
 		}
 
-		// Store the desired MAC address before any operations that might change it
+		// Refresh the container link. The MAC address may have changed during the above operations
+		ctrLink, err = netlink.LinkByIndex(ctrLink.Attrs().Index)
+		if err != nil {
+			return fmt.Errorf("failed to refresh container side of veth pair: %w", err)
+		}
+
+		// Decide what we want the final MAC address to be-- either the requested MAC address
+		// or the random address from the kernel
 		var finalMAC net.HardwareAddr
 		if r.Interface.MacAddress != "" {
 			var err error
@@ -230,22 +244,18 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 			if err != nil {
 				return fmt.Errorf("failed to parse provided MAC address: %w", err)
 			}
+			log.Debugf("Using requested MAC address: %v", finalMAC)
 		} else {
 			// Use the kernel-assigned random MAC address
 			finalMAC = ctrLink.Attrs().HardwareAddr
 			res.Interface.MacAddress = finalMAC.String()
+			log.Debugf("Using auto-assigned MAC address: %v", finalMAC)
 		}
 
-		if err := netlink.LinkSetMaster(hostLink, bridge); err != nil {
-			return fmt.Errorf("failed to attach host side link of veth peer to bridge: %w", err)
-		}
-
-		// Set MAC address after LinkSetMaster since the kernel often resets it during bridge attachment
+		// Assign the final MAC address to the container link
 		if err := netlink.LinkSetHardwareAddr(ctrLink, finalMAC); err != nil {
 			return fmt.Errorf("failed to set container side of veth pair's MAC address: %w", err)
 		}
-
-		log.Debug("VP>>>>>> CreateEndpoint 4 - MAC address set, preparing DHCP")
 
 		timeout := defaultLeaseTimeout
 		if opts.LeaseTimeout != 0 {
@@ -262,13 +272,6 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		// Get IPv4 address via DHCP using consistent MAC address
 		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-
-		log.WithFields(log.Fields{
-			"interface": ctrName,
-			"hostname":  hostname,
-			"timeout":   timeout,
-			"mac":       finalMAC.String(),
-		}).Debug("[dbg] calling GetIP with interface details")
 
 		// Create persistent DHCP client for lease handoff
 		initialClient, err := dhcp.NewDHCPClient(ctrName, &dhcp.DHCPClientOptions{
@@ -288,25 +291,27 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		var info dhcp.Info
 		select {
 		case event := <-events:
-			if event.Type == "bound" {
+			switch event.Type {
+			case "bound":
 				info = event.Data
 				log.WithFields(log.Fields{
 					"interface": ctrName,
 					"ip":        info.IP,
 					"gateway":   info.Gateway,
 				}).Debug("Initial DHCP client acquired lease")
-			} else if event.Type == "leasefail" {
+			case "leasefail":
 				initialClient.Finish(timeoutCtx)
 				return fmt.Errorf("failed to get DHCP lease")
-			} else {
+			default:
 				// Wait for bound event
 				for {
 					select {
 					case nextEvent := <-events:
-						if nextEvent.Type == "bound" {
+						switch nextEvent.Type {
+						case "bound":
 							info = nextEvent.Data
 							goto leaseAcquired
-						} else if nextEvent.Type == "leasefail" {
+						case "leasefail":
 							initialClient.Finish(timeoutCtx)
 							return fmt.Errorf("failed to get DHCP lease")
 						}
@@ -384,7 +389,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		return nil
 	}(); err != nil {
 		// Be sure to clean up the veth pair and initial client if any of this fails
-		netlink.LinkDel(hostLink)
+		netlink.LinkDel(newVeth)
 
 		// Clean up initial client if it was created
 		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
