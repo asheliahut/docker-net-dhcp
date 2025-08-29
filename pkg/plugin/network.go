@@ -212,7 +212,7 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		}
 	}()
 
-	// Acquire initial DHCP leases
+	// Step 1: Acquire initial DHCP leases (without hostname)
 	if err := manager.AcquireInitialLeases(ctx); err != nil {
 		return res, fmt.Errorf("failed to acquire DHCP leases: %w", err)
 	}
@@ -510,8 +510,8 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 			return
 		}
 
-		// Start persistent DHCP clients
-		if err := manager.StartPersistentClients(ctx, r.SandboxKey); err != nil {
+		// Step 2: Start persistent DHCP clients with hostname registration
+		if err := manager.StartPersistentClients(ctx, r.SandboxKey, hostname); err != nil {
 			log.WithError(err).WithFields(log.Fields{
 				"network":  r.NetworkID[:12],
 				"endpoint": r.EndpointID[:12],
