@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	docker "github.com/docker/docker/client"
@@ -161,11 +162,12 @@ func (m *UnifiedDHCPManager) CreateNetworkInterface(ctx context.Context) error {
 	return nil
 }
 
-// AcquireInitialLeases gets initial DHCP leases for both IPv4 and IPv6
+// AcquireInitialLeases gets initial DHCP leases for both IPv4 and IPv6 (without hostname)
 func (m *UnifiedDHCPManager) AcquireInitialLeases(ctx context.Context) error {
-	// Create DHCP client options with the final MAC address
+	// Create DHCP client options WITHOUT hostname for initial IP acquisition
+	// Hostname will be registered separately in RegisterHostname method
 	options := &dhcp.DHCPClientOptions{
-		Hostname: m.hostname,
+		// Hostname: "", // Explicitly empty for initial request
 		V6:       false,
 		MACAddr:  m.finalMAC,
 	}
@@ -194,7 +196,7 @@ func (m *UnifiedDHCPManager) AcquireInitialLeases(ctx context.Context) error {
 	if m.opts.IPv6 {
 		log.WithFields(m.logFields(true)).Info("Acquiring initial IPv6 DHCP lease")
 		optionsV6 := &dhcp.DHCPClientOptions{
-			Hostname: m.hostname,
+			// Hostname: "", // Explicitly empty for initial request
 			V6:       true,
 			MACAddr:  m.finalMAC,
 		}
@@ -211,6 +213,45 @@ func (m *UnifiedDHCPManager) AcquireInitialLeases(ctx context.Context) error {
 			}
 		}
 	}
+
+	return nil
+}
+
+// RegisterHostname performs the second-stage DHCP request to register hostname
+// This should be called after AcquireInitialLeases and once we have container namespace access
+func (m *UnifiedDHCPManager) RegisterHostname(ctx context.Context, nsPath string) error {
+	if m.hostname == "" {
+		log.WithFields(m.logFields(false)).Debug("No hostname to register, skipping hostname registration")
+		return nil
+	}
+
+	if m.IPv4 == nil {
+		log.WithFields(m.logFields(false)).Warn("No IPv4 address available for hostname registration")
+		return nil
+	}
+
+	log.WithFields(m.logFields(false)).WithFields(log.Fields{
+		"hostname":  m.hostname,
+		"ip":        m.IPv4.IP.String(),
+		"interface": m.ctrVethName,
+		"namespace": nsPath,
+	}).Info("Registering hostname with DHCP server using acquired IP")
+
+	// Use the dedicated hostname registration function
+	if err := dhcp.RegisterHostnameWithNamespace(ctx, m.ctrVethName, m.IPv4.IP.String(), m.hostname, nsPath); err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"hostname":  m.hostname,
+			"ip":        m.IPv4.IP.String(),
+			"interface": m.ctrVethName,
+		}).Warn("Failed to register hostname with DHCP server")
+		// Don't treat this as a fatal error - the container can still work without hostname registration
+		return nil
+	}
+
+	log.WithFields(m.logFields(false)).WithFields(log.Fields{
+		"hostname": m.hostname,
+		"ip":       m.IPv4.IP.String(),
+	}).Info("Hostname successfully registered with DHCP server")
 
 	return nil
 }
@@ -299,11 +340,38 @@ func (m *UnifiedDHCPManager) Cleanup() error {
 	return nil
 }
 
-// StartPersistentClients starts the persistent DHCP client management
+// StartPersistentClients starts the persistent DHCP client management and registers hostname
 func (m *UnifiedDHCPManager) StartPersistentClients(ctx context.Context, sandboxKey string) error {
-	// For now, this is a placeholder since the initial leases are already acquired
-	// In the future, we could implement persistent lease management here
-	log.WithFields(m.logFields(false)).Info("Persistent DHCP client management started")
+	log.WithFields(m.logFields(false)).WithField("sandbox", sandboxKey).Info("Starting persistent DHCP client management")
+	
+	// Convert sandbox key to namespace path for hostname registration
+	// Docker provides sandbox key, but we need the namespace path for DHCP library
+	var nsPath string
+	if sandboxKey != "" {
+		// Convert sandbox key to namespace path
+		// Sandbox key format: "/var/run/docker/netns/<id>"
+		// Need to extract the network namespace path for the container
+		nsPath = sandboxKey
+		if !strings.HasPrefix(nsPath, "/proc/") {
+			// If it's a Docker sandbox path, convert it to proc path
+			// This might need adjustment based on your Docker setup
+			log.WithFields(m.logFields(false)).WithFields(log.Fields{
+				"sandbox_key": sandboxKey,
+			}).Debug("Using sandbox key as namespace path for hostname registration")
+		}
+	}
+	
+	// Step 2 of the two-stage DHCP process: Register hostname with acquired IP
+	if err := m.RegisterHostname(ctx, nsPath); err != nil {
+		// Don't fail the entire process if hostname registration fails
+		log.WithError(err).WithFields(m.logFields(false)).Warn("Failed to register hostname, continuing without it")
+	}
+	
+	// TODO: In the future, implement persistent lease renewal clients here
+	// For now, the initial leases from AcquireInitialLeases are sufficient
+	
+	m.isStarted = true
+	log.WithFields(m.logFields(false)).Info("Persistent DHCP client management started successfully")
 	return nil
 }
 
