@@ -212,8 +212,8 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		}
 	}()
 
-	// Step 1: Acquire initial DHCP leases (without hostname)
-	if err := manager.AcquireInitialLeases(ctx); err != nil {
+	// Step 1: Acquire initial DHCP leases (with hostname for lease handoff)
+	if err := manager.AcquireInitialLeases(ctx, hostname); err != nil {
 		return res, fmt.Errorf("failed to acquire DHCP leases: %w", err)
 	}
 

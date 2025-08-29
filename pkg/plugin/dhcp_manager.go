@@ -38,7 +38,7 @@ type UnifiedDHCPManager struct {
 	IPv6    *netlink.Addr
 	gateway string
 
-	// DHCP clients
+	// Single persistent DHCP clients (make two requests: initial + namespace)
 	dhcpClient   *dhcp.DHCPClient
 	dhcpClientV6 *dhcp.DHCPClient
 
@@ -161,23 +161,21 @@ func (m *UnifiedDHCPManager) CreateNetworkInterface(ctx context.Context) error {
 	return nil
 }
 
-// AcquireInitialLeases gets initial DHCP leases for both IPv4 and IPv6 (without hostname)
-func (m *UnifiedDHCPManager) AcquireInitialLeases(ctx context.Context) error {
-	// Create DHCP client options WITHOUT hostname for initial IP acquisition only
-	options := &dhcp.DHCPClientOptions{
-		// Hostname: "", // Explicitly empty - hostname will be registered separately
+// AcquireInitialLeases makes first DHCP request with hostname (stage 1 - host namespace)
+func (m *UnifiedDHCPManager) AcquireInitialLeases(ctx context.Context, hostname string) error {
+	// First DHCP request: get IP + hostname in host namespace (no container namespace yet)
+	log.WithFields(m.logFields(false)).WithField("hostname", hostname).Info("Making first DHCP request with hostname (host namespace)")
+	
+	info, err := dhcp.GetIP(ctx, m.ctrVethName, &dhcp.DHCPClientOptions{
+		Hostname: hostname, // Include hostname in first request
 		V6:       false,
 		MACAddr:  m.finalMAC,
-	}
-
-	// Get IPv4 lease
-	log.WithFields(m.logFields(false)).Info("Acquiring initial IPv4 DHCP lease")
-	info, err := dhcp.GetIP(ctx, m.ctrVethName, options)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to acquire IPv4 DHCP lease: %w", err)
+		return fmt.Errorf("failed to acquire initial IPv4 DHCP lease with hostname: %w", err)
 	}
 
-	// Parse and store IPv4 info
+	// Parse and store IPv4 info from first request
 	m.IPv4, err = netlink.ParseAddr(info.IP)
 	if err != nil {
 		return fmt.Errorf("failed to parse IPv4 address: %w", err)
@@ -185,29 +183,32 @@ func (m *UnifiedDHCPManager) AcquireInitialLeases(ctx context.Context) error {
 	m.gateway = info.Gateway
 
 	log.WithFields(m.logFields(false)).WithFields(log.Fields{
-		"ip":      info.IP,
-		"gateway": info.Gateway,
-		"domain":  info.Domain,
-	}).Info("IPv4 DHCP lease acquired")
+		"ip":       info.IP,
+		"gateway":  info.Gateway,
+		"domain":   info.Domain,
+		"hostname": hostname,
+	}).Info("First DHCP request completed - IP acquired with hostname")
 
-	// Get IPv6 lease if enabled
+	// Handle IPv6 if enabled
 	if m.opts.IPv6 {
-		log.WithFields(m.logFields(true)).Info("Acquiring initial IPv6 DHCP lease")
-		optionsV6 := &dhcp.DHCPClientOptions{
-			// Hostname: "", // Explicitly empty - hostname will be registered separately
+		log.WithFields(m.logFields(true)).WithField("hostname", hostname).Info("Making first IPv6 DHCP request with hostname")
+		
+		infoV6, err := dhcp.GetIP(ctx, m.ctrVethName, &dhcp.DHCPClientOptions{
+			Hostname: hostname,
 			V6:       true,
 			MACAddr:  m.finalMAC,
-		}
-
-		infoV6, err := dhcp.GetIP(ctx, m.ctrVethName, optionsV6)
+		})
 		if err != nil {
-			log.WithError(err).WithFields(m.logFields(true)).Warn("Failed to acquire IPv6 DHCP lease, continuing without IPv6")
+			log.WithError(err).WithFields(m.logFields(true)).Warn("Failed to acquire initial IPv6 lease, continuing without IPv6")
 		} else {
 			m.IPv6, err = netlink.ParseAddr(infoV6.IP)
 			if err != nil {
-				log.WithError(err).WithFields(m.logFields(true)).Warn("Failed to parse IPv6 address, continuing without IPv6")
+				log.WithError(err).WithFields(m.logFields(true)).Warn("Failed to parse IPv6 address")
 			} else {
-				log.WithFields(m.logFields(true)).WithField("ipv6", infoV6.IP).Info("IPv6 DHCP lease acquired")
+				log.WithFields(m.logFields(true)).WithFields(log.Fields{
+					"ipv6":     infoV6.IP,
+					"hostname": hostname,
+				}).Info("First IPv6 DHCP request completed - IPv6 acquired with hostname")
 			}
 		}
 	}
@@ -337,31 +338,117 @@ func (m *UnifiedDHCPManager) Cleanup() error {
 	return nil
 }
 
-// StartPersistentClients starts the persistent DHCP client management and registers hostname
+// StartPersistentClients makes second DHCP request with hostname in container namespace (stage 2)
 func (m *UnifiedDHCPManager) StartPersistentClients(ctx context.Context, sandboxKey string, hostname string) error {
-	log.WithFields(m.logFields(false)).WithField("sandbox", sandboxKey).Info("Starting persistent DHCP client management")
+	log.WithFields(m.logFields(false)).WithFields(log.Fields{
+		"sandbox":  sandboxKey,
+		"hostname": hostname,
+	}).Info("Making second DHCP request with hostname (container namespace)")
 	
-	// Convert sandbox key to namespace path for hostname registration
+	// Convert sandbox key to namespace path
 	var nsPath string
 	if sandboxKey != "" {
 		nsPath = sandboxKey
-		log.WithFields(m.logFields(false)).WithFields(log.Fields{
-			"sandbox_key": sandboxKey,
-		}).Debug("Using sandbox key as namespace path for hostname registration")
 	}
 	
-	// Step 2 of the two-stage DHCP process: Register hostname with acquired IP
+	// Second DHCP request: register hostname with container namespace information
 	if err := m.RegisterHostname(ctx, nsPath, hostname); err != nil {
-		// Don't fail the entire process if hostname registration fails
-		log.WithError(err).WithFields(m.logFields(false)).Warn("Failed to register hostname, continuing without it")
+		log.WithError(err).WithFields(m.logFields(false)).Warn("Failed to make second DHCP request with hostname, continuing without it")
 	}
 	
-	// TODO: In the future, implement persistent lease renewal clients here
-	// For now, the initial leases from AcquireInitialLeases are sufficient
+	// Now start persistent clients for lease maintenance
+	if m.IPv4 != nil {
+		log.WithFields(m.logFields(false)).WithField("hostname", hostname).Info("Starting persistent IPv4 client for lease maintenance")
+		
+		client, err := dhcp.NewDHCPClient(m.ctrVethName, &dhcp.DHCPClientOptions{
+			Hostname:  hostname,
+			V6:        false,
+			Namespace: nsPath,
+			MACAddr:   m.finalMAC,
+			RequestIP: m.IPv4.IP.String(), // Use same IP from first request
+		})
+		if err != nil {
+			log.WithError(err).WithFields(m.logFields(false)).Error("Failed to create persistent IPv4 client")
+		} else {
+			events, err := client.Start()
+			if err != nil {
+				log.WithError(err).WithFields(m.logFields(false)).Error("Failed to start persistent IPv4 client")
+				client.Finish(ctx)
+			} else {
+				m.dhcpClient = client
+				m.errChan = make(chan error)
+				go m.monitorDHCPEvents(events, false, m.errChan)
+				log.WithFields(m.logFields(false)).WithFields(log.Fields{
+					"hostname": hostname,
+					"ip":       m.IPv4.IP.String(),
+				}).Info("Persistent IPv4 client started for lease maintenance")
+			}
+		}
+	}
+	
+	// Handle IPv6 persistent client if available
+	if m.IPv6 != nil {
+		log.WithFields(m.logFields(true)).WithField("hostname", hostname).Info("Starting persistent IPv6 client for lease maintenance")
+		
+		clientV6, err := dhcp.NewDHCPClient(m.ctrVethName, &dhcp.DHCPClientOptions{
+			Hostname:  hostname,
+			V6:        true,
+			Namespace: nsPath,
+			MACAddr:   m.finalMAC,
+			RequestIP: m.IPv6.IP.String(), // Use same IP from first request
+		})
+		if err != nil {
+			log.WithError(err).WithFields(m.logFields(true)).Error("Failed to create persistent IPv6 client")
+		} else {
+			eventsV6, err := clientV6.Start()
+			if err != nil {
+				log.WithError(err).WithFields(m.logFields(true)).Error("Failed to start persistent IPv6 client")
+				clientV6.Finish(ctx)
+			} else {
+				m.dhcpClientV6 = clientV6
+				m.errChanV6 = make(chan error)
+				go m.monitorDHCPEvents(eventsV6, true, m.errChanV6)
+				log.WithFields(m.logFields(true)).WithFields(log.Fields{
+					"hostname": hostname,
+					"ipv6":     m.IPv6.IP.String(),
+				}).Info("Persistent IPv6 client started for lease maintenance")
+			}
+		}
+	}
 	
 	m.isStarted = true
-	log.WithFields(m.logFields(false)).Info("Persistent DHCP client management started successfully")
+	log.WithFields(m.logFields(false)).Info("Second DHCP request completed and persistent clients started")
 	return nil
+}
+
+// monitorDHCPEvents monitors events from persistent DHCP clients
+func (m *UnifiedDHCPManager) monitorDHCPEvents(events <-chan dhcp.Event, isIPv6 bool, errChan chan error) {
+	defer close(errChan)
+	
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				// Events channel closed, DHCP client stopped
+				log.WithFields(m.logFields(isIPv6)).Debug("DHCP client events channel closed")
+				return
+			}
+			
+			// Handle DHCP events (renewal, etc.)
+			switch event.Type {
+			case "bound":
+				log.WithFields(m.logFields(isIPv6)).WithField("ip", event.Data.IP).Debug("DHCP client lease bound")
+			case "renew":
+				log.WithFields(m.logFields(isIPv6)).WithField("ip", event.Data.IP).Debug("DHCP client lease renewed")
+			case "leasefail":
+				log.WithFields(m.logFields(isIPv6)).Warn("DHCP client lease failed")
+			}
+			
+		case <-m.stopChan:
+			log.WithFields(m.logFields(isIPv6)).Info("Stopping DHCP client event monitoring")
+			return
+		}
+	}
 }
 
 // forceCleanup performs emergency cleanup
