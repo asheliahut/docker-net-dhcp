@@ -707,15 +707,6 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		return nil
 	}
 
-	// Create DHCP REQUEST using library's built-in client identification
-	requestModifiers := []dhcpv4.Modifier{
-		dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(clientIP)),
-		dhcpv4.WithOption(dhcpv4.OptHostName(hostname)),
-		dhcpv4.WithOption(dhcpv4.OptClassIdentifier("docker-net-dhcp")),
-		dhcpv4.WithOption(dhcpv4.OptClientIdentifier(netIface.HardwareAddr)),
-		// Use a very short lease time to signal this is an update, not a new lease
-		dhcpv4.WithOption(dhcpv4.OptIPAddressLeaseTime(60 * time.Second)),
-	}
 
 	// Create a timeout context for the hostname registration
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -729,9 +720,32 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		"client_ip": clientIP.String(),
 	}).Info("RegisterHostname: Sending DHCP REQUEST for hostname registration with existing IP")
 
-	// Send the REQUEST message using the client's Request method
-	// This properly handles the DHCP protocol flow
-	_, err = client.Request(timeoutCtx, requestModifiers...)
+	// Create a direct DHCP REQUEST message with the existing IP and hostname
+	// This avoids the full DISCOVER/OFFER cycle that client.Request() does
+	requestMsg, err := dhcpv4.NewRequestFromOffer(&dhcpv4.DHCPv4{})
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"interface": iface,
+			"hostname":  hostname,
+			"ip":        currentIP,
+		}).Error("RegisterHostname: Failed to create DHCP REQUEST message")
+		return nil
+	}
+
+	// Set the hardware address and requested IP
+	requestMsg.ClientHWAddr = netIface.HardwareAddr
+	requestMsg.YourIPAddr = clientIP
+
+	// Add all the required options for hostname registration
+	requestMsg.UpdateOption(dhcpv4.OptRequestedIPAddress(clientIP))
+	requestMsg.UpdateOption(dhcpv4.OptHostName(hostname))
+	requestMsg.UpdateOption(dhcpv4.OptClassIdentifier("docker-net-dhcp"))
+	requestMsg.UpdateOption(dhcpv4.OptClientIdentifier(netIface.HardwareAddr))
+	requestMsg.UpdateOption(dhcpv4.OptIPAddressLeaseTime(60 * time.Second))
+
+	// Send the REQUEST message directly
+	// SendAndRead requires server address and matcher, but for broadcast we can use nil server
+	_, err = client.SendAndRead(timeoutCtx, nil, requestMsg, nil)
 	if err != nil {
 		// Log as warning since hostname registration failures are often non-critical
 		log.WithError(err).WithFields(log.Fields{
