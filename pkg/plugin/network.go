@@ -13,7 +13,6 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/asheliahut/docker-net-dhcp/pkg/dhcp"
 	"github.com/asheliahut/docker-net-dhcp/pkg/util"
 )
 
@@ -138,8 +137,7 @@ func (p *Plugin) netOptions(ctx context.Context, id string) (DHCPNetworkOptions,
 	return opts, nil
 }
 
-// CreateEndpoint creates a veth pair and uses DHCP to acquire an initial IP address on the container end. Docker will
-// move the interface into the container's namespace and apply the address.
+// CreateEndpoint creates a network interface using the unified DHCP manager
 func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (CreateEndpointResponse, error) {
 	log.WithFields(log.Fields{
 		"endpoint_id": r.EndpointID,
@@ -149,8 +147,10 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		"mac_address": r.Interface.MacAddress,
 		"options":     r.Options,
 	}).Debug("CreateEndpoint")
+
 	ctx, cancel := context.WithTimeout(ctx, p.awaitTimeout)
 	defer cancel()
+
 	res := CreateEndpointResponse{
 		Interface: &EndpointInterface{},
 	}
@@ -159,6 +159,8 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		// TODO: Should we allow static IP's somehow?
 		return res, util.ErrIPAM
 	}
+
+	// Get network options with retry logic
 	var opts DHCPNetworkOptions
 	var err error
 	backoff := 2 * time.Second
@@ -178,239 +180,74 @@ func (p *Plugin) CreateEndpoint(ctx context.Context, r CreateEndpointRequest) (C
 		backoff *= 2
 	}
 
-	bridge, err := netlink.LinkByName(opts.Bridge)
-	if err != nil {
-		return res, fmt.Errorf("failed to get bridge interface: %w", err)
+	// Extract hostname from options
+	hostname := ""
+	if r.Options != nil {
+		if hostI, ok := r.Options["hostname"]; ok {
+			hostname, _ = hostI.(string)
+		}
 	}
 
-	hostName, ctrName := vethPairNames(r.EndpointID)
-	la := netlink.NewLinkAttrs()
-	la.Name = hostName
-	newVeth := &netlink.Veth{
-		LinkAttrs: la,
-		PeerName:  ctrName,
-	}
-
+	// Parse required MAC address if provided
+	var requiredMAC net.HardwareAddr
 	if r.Interface.MacAddress != "" {
-		addr, err := net.ParseMAC(r.Interface.MacAddress)
+		requiredMAC, err = net.ParseMAC(r.Interface.MacAddress)
 		if err != nil {
 			return res, util.ErrMACAddress
 		}
-
-		newVeth.PeerHardwareAddr = addr
 	}
 
-	// Create the veth pair
-	if err := netlink.LinkAdd(newVeth); err != nil {
-		return res, fmt.Errorf("failed to create veth pair: %w", err)
+	// Create unified DHCP manager
+	manager := NewUnifiedDHCPManager(p.docker, r.NetworkID, r.EndpointID, opts, hostname, requiredMAC, p.awaitTimeout)
+
+	// Create network interface
+	if err := manager.CreateNetworkInterface(ctx); err != nil {
+		return res, fmt.Errorf("failed to create network interface: %w", err)
 	}
-	if err := func() error {
-		// Get the host and container links from the veth pair
-		hostLink, err := netlink.LinkByName(hostName)
+
+	// Cleanup on error
+	defer func() {
 		if err != nil {
-			return fmt.Errorf("failed to find host side of veth pair: %w", err)
+			manager.Cleanup()
 		}
+	}()
 
-		ctrLink, err := netlink.LinkByName(ctrName)
-		if err != nil {
-			return fmt.Errorf("failed to find container side of veth pair: %w", err)
-		}
-
-		// Forward the host side of the pair to the bridge interface
-		if err := netlink.LinkSetMaster(hostLink, bridge); err != nil {
-			return fmt.Errorf("failed to attach host side link of veth peer to bridge: %w", err)
-		}
-
-		// Bring up the host side and container side of the veth pair
-		if err := netlink.LinkSetUp(hostLink); err != nil {
-			return fmt.Errorf("failed to set host side link of veth pair up: %w", err)
-		}
-		if err := netlink.LinkSetUp(ctrLink); err != nil {
-			return fmt.Errorf("failed to set container side link of veth pair up: %w", err)
-		}
-
-		// Refresh the container link. The MAC address may have changed during the above operations
-		ctrLink, err = netlink.LinkByIndex(ctrLink.Attrs().Index)
-		if err != nil {
-			return fmt.Errorf("failed to refresh container side of veth pair: %w", err)
-		}
-
-		// Decide what we want the final MAC address to be-- either the requested MAC address
-		// or the random address from the kernel
-		var finalMAC net.HardwareAddr
-		if r.Interface.MacAddress != "" {
-			var err error
-			finalMAC, err = net.ParseMAC(r.Interface.MacAddress)
-			if err != nil {
-				return fmt.Errorf("failed to parse provided MAC address: %w", err)
-			}
-			log.Debugf("Using requested MAC address: %v", finalMAC)
-		} else {
-			// Use the kernel-assigned random MAC address
-			finalMAC = ctrLink.Attrs().HardwareAddr
-			res.Interface.MacAddress = finalMAC.String()
-			log.Debugf("Using auto-assigned MAC address: %v", finalMAC)
-		}
-
-		// Assign the final MAC address to the container link
-		if err := netlink.LinkSetHardwareAddr(ctrLink, finalMAC); err != nil {
-			return fmt.Errorf("failed to set container side of veth pair's MAC address: %w", err)
-		}
-
-		timeout := defaultLeaseTimeout
-		if opts.LeaseTimeout != 0 {
-			timeout = opts.LeaseTimeout
-		}
-
-		hostname := ""
-		if r.Options != nil {
-			if idI, ok := r.Options["hostname"]; ok {
-				hostname, _ = idI.(string)
-			}
-		}
-
-		// Get IPv4 address via DHCP using consistent MAC address
-		timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-
-		// Create persistent DHCP client for lease handoff
-		initialClient, err := dhcp.NewDHCPClient(ctrName, &dhcp.DHCPClientOptions{
-			Hostname: hostname,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to create initial DHCP client: %w", err)
-		}
-
-		// Start the client
-		events, err := initialClient.Start()
-		if err != nil {
-			return fmt.Errorf("failed to start initial DHCP client: %w", err)
-		}
-
-		// Wait for initial lease
-		var info dhcp.Info
-		select {
-		case event := <-events:
-			switch event.Type {
-			case "bound":
-				info = event.Data
-				log.WithFields(log.Fields{
-					"interface": ctrName,
-					"ip":        info.IP,
-					"gateway":   info.Gateway,
-				}).Debug("Initial DHCP client acquired lease")
-			case "leasefail":
-				initialClient.Finish(timeoutCtx)
-				return fmt.Errorf("failed to get DHCP lease")
-			default:
-				// Wait for bound event
-				for {
-					select {
-					case nextEvent := <-events:
-						switch nextEvent.Type {
-						case "bound":
-							info = nextEvent.Data
-							goto leaseAcquired
-						case "leasefail":
-							initialClient.Finish(timeoutCtx)
-							return fmt.Errorf("failed to get DHCP lease")
-						}
-					case <-timeoutCtx.Done():
-						initialClient.Finish(timeoutCtx)
-						return fmt.Errorf("timeout waiting for DHCP lease")
-					}
-				}
-			}
-		case <-timeoutCtx.Done():
-			initialClient.Finish(timeoutCtx)
-			return fmt.Errorf("timeout waiting for DHCP lease")
-		}
-
-	leaseAcquired:
-		// Store the client for lease handoff
-		p.initialDHCP[r.EndpointID] = initialClient
-
-		ipv4, err := netlink.ParseAddr(info.IP)
-		if err != nil {
-			initialClient.Finish(timeoutCtx)
-			return fmt.Errorf("failed to parse initial IPv4 address: %w", err)
-		}
-
-		hint := p.joinHints[r.EndpointID]
-		res.Interface.Address = info.IP
-		hint.IPv4 = ipv4
-		hint.Gateway = info.Gateway
-		hint.MAC = finalMAC
-
-		// Get IPv6 address if enabled - using native DHCPv6 client
-		if opts.IPv6 {
-			timeoutCtxV6, cancelV6 := context.WithTimeout(ctx, timeout)
-			defer cancelV6()
-
-			infoV6, err := dhcp.GetIP(timeoutCtxV6, ctrName, &dhcp.DHCPClientOptions{
-				V6:       true,
-				Hostname: hostname,
-			})
-			if err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"network":  r.NetworkID[:12],
-					"endpoint": r.EndpointID[:12],
-				}).Warn("Failed to get initial IPv6 address via DHCP, skipping IPv6 configuration")
-
-				// Continue without IPv6 - container can use SLAAC or static configuration
-				res.Interface.AddressIPv6 = ""
-				hint.IPv6 = nil
-			} else {
-				ipv6, err := netlink.ParseAddr(infoV6.IP)
-				if err != nil {
-					log.WithError(err).WithFields(log.Fields{
-						"network":  r.NetworkID[:12],
-						"endpoint": r.EndpointID[:12],
-						"ipv6":     infoV6.IP,
-					}).Warn("Failed to parse initial IPv6 address, skipping IPv6 configuration")
-
-					res.Interface.AddressIPv6 = ""
-					hint.IPv6 = nil
-				} else {
-					res.Interface.AddressIPv6 = infoV6.IP
-					hint.IPv6 = ipv6
-
-					log.WithFields(log.Fields{
-						"network":  r.NetworkID[:12],
-						"endpoint": r.EndpointID[:12],
-						"ipv6":     infoV6.IP,
-					}).Info("IPv6 address acquired via DHCPv6")
-				}
-			}
-		}
-
-		p.joinHints[r.EndpointID] = hint
-
-		return nil
-	}(); err != nil {
-		// Be sure to clean up the veth pair and initial client if any of this fails
-		netlink.LinkDel(newVeth)
-
-		// Clean up initial client if it was created
-		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			initialClient.Finish(ctx)
-			cancel()
-			delete(p.initialDHCP, r.EndpointID)
-		}
-
-		return res, err
+	// Acquire initial DHCP leases
+	if err := manager.AcquireInitialLeases(ctx); err != nil {
+		return res, fmt.Errorf("failed to acquire DHCP leases: %w", err)
 	}
+
+	// Get interface information for Docker
+	ipv4, ipv6, macAddr, gateway := manager.GetInterfaceInfo()
+	res.Interface.Address = ipv4
+	res.Interface.AddressIPv6 = ipv6
+	res.Interface.MacAddress = macAddr
+
+	// Store manager for join phase
+	hostName, _ := vethPairNames(r.EndpointID)
+	p.unifiedDHCP[r.EndpointID] = manager
+
+	// Store join hints for compatibility
+	hint := p.joinHints[r.EndpointID]
+	if manager.IPv4 != nil {
+		hint.IPv4 = manager.IPv4
+	}
+	if manager.IPv6 != nil {
+		hint.IPv6 = manager.IPv6
+	}
+	hint.Gateway = gateway
+	hint.MAC = manager.finalMAC
+	p.joinHints[r.EndpointID] = hint
 
 	log.WithFields(log.Fields{
 		"network":     r.NetworkID[:12],
 		"endpoint":    r.EndpointID[:12],
-		"mac_address": res.Interface.MacAddress,
-		"ip":          res.Interface.Address,
-		"ipv6":        res.Interface.AddressIPv6,
-		"gateway":     fmt.Sprintf("%#v", p.joinHints[r.EndpointID].Gateway),
+		"mac_address": macAddr,
+		"ip":          ipv4,
+		"ipv6":        ipv6,
+		"gateway":     gateway,
 		"hostname":    hostName,
-	}).Info("Endpoint created")
+	}).Info("Endpoint created with unified DHCP manager")
 
 	return res, nil
 }
@@ -448,8 +285,29 @@ func (p *Plugin) EndpointOperInfo(ctx context.Context, r InfoRequest) (InfoRespo
 	return res, nil
 }
 
-// DeleteEndpoint deletes the veth pair
+// DeleteEndpoint deletes the network interface and cleans up resources
 func (p *Plugin) DeleteEndpoint(r DeleteEndpointRequest) error {
+	// Try unified manager first
+	if manager, exists := p.unifiedDHCP[r.EndpointID]; exists {
+		if err := manager.Cleanup(); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"network":  r.NetworkID[:12],
+				"endpoint": r.EndpointID[:12],
+			}).Warn("Failed to cleanup unified DHCP manager")
+		}
+		delete(p.unifiedDHCP, r.EndpointID)
+
+		log.WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+		}).Info("Endpoint deleted (unified manager)")
+
+		// Clean up join hints
+		delete(p.joinHints, r.EndpointID)
+		return nil
+	}
+
+	// Fallback to legacy cleanup for backward compatibility
 	hostName, _ := vethPairNames(r.EndpointID)
 	link, err := netlink.LinkByName(hostName)
 	if err != nil {
@@ -479,7 +337,7 @@ func (p *Plugin) DeleteEndpoint(r DeleteEndpointRequest) error {
 	log.WithFields(log.Fields{
 		"network":  r.NetworkID[:12],
 		"endpoint": r.EndpointID[:12],
-	}).Info("Endpoint deleted")
+	}).Info("Endpoint deleted (legacy)")
 
 	return nil
 }
@@ -629,6 +487,7 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 		}
 	}
 
+	// Start persistent DHCP clients in the background
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), p.awaitTimeout)
 		defer cancel()
@@ -638,50 +497,34 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 			"endpoint": r.EndpointID[:12],
 			"sandbox":  r.SandboxKey,
 			"hostname": hostname,
-		}).Debug("[Join] Starting DHCP manager goroutine")
+		}).Debug("[Join] Starting persistent DHCP clients")
 
-		m := newDHCPManager(p.docker, r, opts, hostname)
-		m.LastIP = hint.IPv4
-		m.LastIPv6 = hint.IPv6
-		m.OriginalMAC = hint.MAC
-
-		log.WithFields(log.Fields{
-			"network":        r.NetworkID[:12],
-			"endpoint":       r.EndpointID[:12],
-			"sandbox":        r.SandboxKey,
-			"hostname":       hostname,
-			"hostname_empty": hostname == "",
-			"hint_ipv4":      hint.IPv4,
-			"hint_ipv4_nil":  hint.IPv4 == nil,
-		}).Debug("[Join] DHCP manager will handle hostname registration in container namespace")
-
-		// Transfer the initial client to the manager for lease handoff
-		if initialClient, exists := p.initialDHCP[r.EndpointID]; exists {
-			m.leaseClient = initialClient
-			delete(p.initialDHCP, r.EndpointID)
+		// Get the unified manager that was created in CreateEndpoint
+		manager, exists := p.unifiedDHCP[r.EndpointID]
+		if !exists {
 			log.WithFields(log.Fields{
 				"network":  r.NetworkID[:12],
 				"endpoint": r.EndpointID[:12],
 				"sandbox":  r.SandboxKey,
-			}).Debug("Transferred initial DHCP client to manager for lease handoff")
-		} else {
-			log.WithFields(log.Fields{
-				"network":  r.NetworkID[:12],
-				"endpoint": r.EndpointID[:12],
-				"sandbox":  r.SandboxKey,
-			}).Warn("No initial DHCP client found for lease handoff")
+			}).Error("No unified DHCP manager found for endpoint")
+			return
 		}
 
-		if err := m.Start(ctx); err != nil {
+		// Start persistent DHCP clients
+		if err := manager.StartPersistentClients(ctx, r.SandboxKey); err != nil {
 			log.WithError(err).WithFields(log.Fields{
 				"network":  r.NetworkID[:12],
 				"endpoint": r.EndpointID[:12],
 				"sandbox":  r.SandboxKey,
-			}).Error("Failed to start persistent DHCP client")
+			}).Error("Failed to start persistent DHCP clients")
 			return
 		}
 
-		p.persistentDHCP[r.EndpointID] = m
+		log.WithFields(log.Fields{
+			"network":  r.NetworkID[:12],
+			"endpoint": r.EndpointID[:12],
+			"sandbox":  r.SandboxKey,
+		}).Info("Persistent DHCP clients started successfully")
 	}()
 
 	log.WithFields(log.Fields{
@@ -695,44 +538,51 @@ func (p *Plugin) Join(ctx context.Context, r JoinRequest) (JoinResponse, error) 
 
 // Leave stops the persistent DHCP client for an endpoint
 func (p *Plugin) Leave(ctx context.Context, r LeaveRequest) error {
-	manager, ok := p.persistentDHCP[r.EndpointID]
-	if !ok {
-		return util.ErrNoSandbox
-	}
-	delete(p.persistentDHCP, r.EndpointID)
+	// Try unified manager first
+	if manager, exists := p.unifiedDHCP[r.EndpointID]; exists {
+		delete(p.unifiedDHCP, r.EndpointID)
 
-	// Use timeout context for cleanup
-	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+		// Use timeout context for cleanup
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
 
-	// Stop manager with timeout
-	done := make(chan error, 1)
-	go func() {
-		done <- manager.Stop()
-	}()
+		// Stop manager with timeout
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.Stop()
+		}()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			log.WithError(err).WithFields(log.Fields{
+		select {
+		case err := <-done:
+			if err != nil {
+				log.WithError(err).WithFields(log.Fields{
+					"network":  r.NetworkID[:12],
+					"endpoint": r.EndpointID[:12],
+				}).Warn("Error during unified manager stop, but continuing")
+			}
+		case <-cleanupCtx.Done():
+			log.WithFields(log.Fields{
 				"network":  r.NetworkID[:12],
 				"endpoint": r.EndpointID[:12],
-			}).Warn("Error during manager stop, but continuing")
+			}).Warn("Timeout during unified manager cleanup, forcing stop")
+
+			// Force cleanup in background
+			go manager.forceCleanup()
 		}
-	case <-cleanupCtx.Done():
+
 		log.WithFields(log.Fields{
 			"network":  r.NetworkID[:12],
 			"endpoint": r.EndpointID[:12],
-		}).Warn("Timeout during manager cleanup, forcing stop")
+		}).Info("Sandbox left endpoint (unified manager)")
 
-		// Force cleanup in background
-		go manager.forceCleanup()
+		return nil
 	}
 
+	// No unified manager found
 	log.WithFields(log.Fields{
 		"network":  r.NetworkID[:12],
 		"endpoint": r.EndpointID[:12],
-	}).Info("Sandbox left endpoint")
+	}).Warn("No DHCP manager found for endpoint")
 
-	return nil
+	return util.ErrNoSandbox
 }

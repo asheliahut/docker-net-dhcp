@@ -77,9 +77,12 @@ type Plugin struct {
 	docker *docker.Client
 	server http.Server
 
-	joinHints      map[string]joinHint
-	persistentDHCP map[string]*dhcpManager
-	initialDHCP    map[string]*dhcp.DHCPClient
+	joinHints   map[string]joinHint
+	unifiedDHCP map[string]*UnifiedDHCPManager // New unified manager
+	// Legacy maps for backward compatibility during transition
+	// Legacy map - will be removed once transition is complete
+	// unifiedDHCP map[string]*UnifiedDHCPManager
+	initialDHCP map[string]*dhcp.DHCPClient
 
 	// Container lifecycle tracking
 	eventChan   chan events.Message
@@ -125,9 +128,10 @@ func NewPlugin(awaitTimeout time.Duration) (*Plugin, error) {
 
 		docker: client,
 
-		joinHints:      make(map[string]joinHint),
-		persistentDHCP: make(map[string]*dhcpManager),
-		initialDHCP:    make(map[string]*dhcp.DHCPClient),
+		joinHints:   make(map[string]joinHint),
+		unifiedDHCP: make(map[string]*UnifiedDHCPManager),
+		// unifiedDHCP: make(map[string]*UnifiedDHCPManager), // Legacy - commented out
+		initialDHCP: make(map[string]*dhcp.DHCPClient),
 
 		eventChan:    eventChan,
 		eventCancel:  eventCancel,
@@ -249,7 +253,7 @@ func (p *Plugin) handleContainerEvent(event events.Message) {
 	if action == "die" || action == "kill" || action == "stop" {
 		// Find any DHCP managers for this container
 		var managersToCleanup []string
-		for endpointID, manager := range p.persistentDHCP {
+		for endpointID, manager := range p.unifiedDHCP {
 			// Check if this manager is for the stopped container
 			if p.isManagerForContainer(manager, containerID) {
 				managersToCleanup = append(managersToCleanup, endpointID)
@@ -258,7 +262,7 @@ func (p *Plugin) handleContainerEvent(event events.Message) {
 
 		// Clean up managers for stopped container
 		for _, endpointID := range managersToCleanup {
-			manager := p.persistentDHCP[endpointID]
+			manager := p.unifiedDHCP[endpointID]
 			log.WithFields(log.Fields{
 				"container": containerID[:12],
 				"endpoint":  endpointID[:12],
@@ -271,13 +275,13 @@ func (p *Plugin) handleContainerEvent(event events.Message) {
 					"endpoint":  endpointID[:12],
 				}).Error("Failed to stop DHCP manager for stopped container")
 			}
-			delete(p.persistentDHCP, endpointID)
+			delete(p.unifiedDHCP, endpointID)
 		}
 	}
 }
 
 // isManagerForContainer checks if a DHCP manager belongs to a specific container
-func (p *Plugin) isManagerForContainer(manager *dhcpManager, containerID string) bool {
+func (p *Plugin) isManagerForContainer(manager *UnifiedDHCPManager, containerID string) bool {
 	// We need to check if the manager's network namespace corresponds to this container
 	// This is done by inspecting the network to find containers and matching endpoint IDs
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -324,7 +328,7 @@ func (p *Plugin) performPeriodicCleanup() {
 	staleInitialClients := make([]string, 0)
 
 	// Check each DHCP manager for staleness
-	for endpointID, manager := range p.persistentDHCP {
+	for endpointID, manager := range p.unifiedDHCP {
 		if p.isManagerStale(manager) {
 			staleManagers = append(staleManagers, endpointID)
 		}
@@ -333,23 +337,23 @@ func (p *Plugin) performPeriodicCleanup() {
 	// Check for stale initial clients (shouldn't happen, but safety net)
 	for endpointID := range p.initialDHCP {
 		// If there's an initial client without a corresponding manager, it's likely stale
-		if _, hasManager := p.persistentDHCP[endpointID]; !hasManager {
+		if _, hasManager := p.unifiedDHCP[endpointID]; !hasManager {
 			staleInitialClients = append(staleInitialClients, endpointID)
 		}
 	}
 
 	// Clean up stale managers
 	for _, endpointID := range staleManagers {
-		manager := p.persistentDHCP[endpointID]
+		manager := p.unifiedDHCP[endpointID]
 		log.WithField("endpoint", endpointID[:12]).Info("Cleaning up stale DHCP manager")
 
-		go func(m *dhcpManager, id string) {
+		go func(m *UnifiedDHCPManager, id string) {
 			if err := m.Stop(); err != nil {
 				log.WithError(err).WithField("endpoint", id[:12]).Error("Failed to stop stale DHCP manager")
 			}
 		}(manager, endpointID)
 
-		delete(p.persistentDHCP, endpointID)
+		delete(p.unifiedDHCP, endpointID)
 	}
 
 	// Clean up stale initial clients
@@ -379,7 +383,7 @@ func (p *Plugin) performPeriodicCleanup() {
 }
 
 // isManagerStale checks if a DHCP manager is stale (container no longer exists)
-func (p *Plugin) isManagerStale(manager *dhcpManager) bool {
+func (p *Plugin) isManagerStale(manager *UnifiedDHCPManager) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -405,21 +409,21 @@ func (p *Plugin) isManagerStale(manager *dhcpManager) bool {
 
 // cleanupAllManagers cleans up all managers with timeout
 func (p *Plugin) cleanupAllManagers(timeout time.Duration) {
-	if len(p.persistentDHCP) == 0 {
+	if len(p.unifiedDHCP) == 0 {
 		return
 	}
 
-	log.WithField("count", len(p.persistentDHCP)).Info("Cleaning up all DHCP managers")
+	log.WithField("count", len(p.unifiedDHCP)).Info("Cleaning up all DHCP managers")
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	// Create a channel to track completion
-	done := make(chan struct{}, len(p.persistentDHCP))
+	done := make(chan struct{}, len(p.unifiedDHCP))
 
 	// Start cleanup for each manager
-	for endpointID, manager := range p.persistentDHCP {
-		go func(m *dhcpManager, id string) {
+	for endpointID, manager := range p.unifiedDHCP {
+		go func(m *UnifiedDHCPManager, id string) {
 			defer func() { done <- struct{}{} }()
 
 			if err := m.Stop(); err != nil {
@@ -429,7 +433,7 @@ func (p *Plugin) cleanupAllManagers(timeout time.Duration) {
 	}
 
 	// Wait for all managers to finish or timeout
-	managersToWait := len(p.persistentDHCP)
+	managersToWait := len(p.unifiedDHCP)
 	for i := 0; i < managersToWait; i++ {
 		select {
 		case <-done:
@@ -437,20 +441,20 @@ func (p *Plugin) cleanupAllManagers(timeout time.Duration) {
 		case <-ctx.Done():
 			log.Warn("Timeout waiting for DHCP managers to stop, forcing cleanup")
 			// Force cleanup remaining managers
-			for _, manager := range p.persistentDHCP {
+			for _, manager := range p.unifiedDHCP {
 				go manager.forceCleanup()
 			}
 			// Clear the map
-			for endpointID := range p.persistentDHCP {
-				delete(p.persistentDHCP, endpointID)
+			for endpointID := range p.unifiedDHCP {
+				delete(p.unifiedDHCP, endpointID)
 			}
 			return
 		}
 	}
 
 	// Clear the map
-	for endpointID := range p.persistentDHCP {
-		delete(p.persistentDHCP, endpointID)
+	for endpointID := range p.unifiedDHCP {
+		delete(p.unifiedDHCP, endpointID)
 	}
 
 	log.Info("All DHCP managers cleaned up")

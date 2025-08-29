@@ -32,7 +32,8 @@ type DHCPClientOptions struct {
 	V6        bool // Currently unsupported, kept for compatibility
 	Namespace string
 	RequestIP string
-	LeaseTime time.Duration // Optional lease time preference
+	LeaseTime time.Duration    // Optional lease time preference
+	MACAddr   net.HardwareAddr // Optional MAC address for client identification
 }
 
 // DHCPClient represents a native Go DHCP client
@@ -132,7 +133,7 @@ func (c *DHCPClient) runDHCPv4Client(events chan Event) {
 
 	c.client4 = client
 
-	// Configure DHCP options
+	// Configure DHCP options using library's built-in client identification
 	modifiers := []dhcpv4.Modifier{}
 
 	if c.opts.Hostname != "" {
@@ -145,6 +146,18 @@ func (c *DHCPClient) runDHCPv4Client(events chan Event) {
 
 	// Add vendor ID for identification
 	modifiers = append(modifiers, dhcpv4.WithOption(dhcpv4.OptClassIdentifier("docker-net-dhcp")))
+
+	// Use library's client identifier with interface MAC (or provided MAC)
+	clientMAC := c.opts.MACAddr
+	if clientMAC == nil {
+		// Get interface MAC address using the library's approach
+		if iface, err := net.InterfaceByName(c.ifaceName); err == nil {
+			clientMAC = iface.HardwareAddr
+		}
+	}
+	if clientMAC != nil {
+		modifiers = append(modifiers, dhcpv4.WithOption(dhcpv4.OptClientIdentifier(clientMAC)))
+	}
 
 	ctx := context.Background()
 
@@ -684,7 +697,7 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 	}
 	defer client.Close()
 
-	// Get interface hardware address
+	// Get interface hardware address for client identification
 	netIface, err := net.InterfaceByName(iface)
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
@@ -694,9 +707,7 @@ func RegisterHostnameWithNamespace(ctx context.Context, iface string, currentIP 
 		return nil
 	}
 
-	// Create a DHCP REQUEST message that updates hostname for existing lease
-	// This avoids "address in use" by explicitly requesting the same IP we already have
-	// We'll use client.Request with modifiers to send a proper REQUEST
+	// Create DHCP REQUEST using library's built-in client identification
 	requestModifiers := []dhcpv4.Modifier{
 		dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(clientIP)),
 		dhcpv4.WithOption(dhcpv4.OptHostName(hostname)),
